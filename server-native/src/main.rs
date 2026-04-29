@@ -188,19 +188,19 @@ async fn handle_ws(
                                 if let Some(expected) = &*password {
                                     if pwd == expected {
                                         is_authenticated = true;
-                                        let _ = ws_sender.send(Message::Text("OK".to_string())).await;
+                                        let _ = ws_sender.send(Message::Text("OK".into())).await;
                                     } else {
-                                        let _ = ws_sender.send(Message::Text("ERR invalid password".to_string())).await;
+                                        let _ = ws_sender.send(Message::Text("ERR invalid password".into())).await;
                                     }
                                 } else {
-                                    let _ = ws_sender.send(Message::Text("ERR Client sent AUTH, but no password is set".to_string())).await;
+                                    let _ = ws_sender.send(Message::Text("ERR Client sent AUTH, but no password is set".into())).await;
                                 }
                                 continue;
                             }
 
                             // Block unauthorized commands
                             if !is_authenticated {
-                                let _ = ws_sender.send(Message::Text("NOAUTH Authentication required.".to_string())).await;
+                                let _ = ws_sender.send(Message::Text("NOAUTH Authentication required.".into())).await;
                                 continue;
                             }
 
@@ -217,7 +217,7 @@ async fn handle_ws(
             // Receive broadcasted changes from the server channel
             Ok(msg) = rx.recv() => {
                 // Echo the change back out to this WebSocket
-                let _ = ws_sender.send(Message::Text(msg)).await;
+                let _ = ws_sender.send(Message::Text(msg.into())).await;
             }
         }
     }

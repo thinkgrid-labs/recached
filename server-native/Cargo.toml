@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.21"
+tokio-tungstenite = "0.29.0"
 futures-util = "0.3"
 core-engine = { path = "../core-engine" }
