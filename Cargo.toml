@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "core-engine",
+    "server-native",
+    "wasm-edge"
+]
+resolver = "2"

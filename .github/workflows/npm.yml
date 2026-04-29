@@ -1,0 +1,34 @@
+name: Publish Wasm Package to NPM
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+          
+      - name: Build Wasm Package
+        run: |
+          cd wasm-edge
+          wasm-pack build --target web
+          
+      - name: Publish to NPM
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "Ready to publish to NPM!"
+          # To enable actual publishing, uncomment the line below:
+          # cd wasm-edge/pkg && npm publish --access public
