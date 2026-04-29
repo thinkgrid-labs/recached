@@ -1,0 +1,38 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+    branches: [ "main", "dev" ]
+
+jobs:
+  quality-checks:
+    name: Lint, Format, and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "recached-ci-cache"
+
+      - name: Check Formatting
+        # Fails the build if the code is not formatted properly
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy Linter
+        # -D warnings treats warnings as errors, enforcing strict code quality
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run Tests
+        # Runs unit tests across the entire workspace
+        run: cargo test --workspace
