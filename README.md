@@ -15,6 +15,10 @@
 
 Whether you are scaling massive backend infrastructure or building real-time, local-first web applications, Liyab provides unmatched performance and developer experience.
 
+> [!WARNING]
+> **Status: Active Development**  
+> Liyab is currently in its MVP phase and is **not yet ready for production workloads**. The core architecture is completely functional, but many advanced Redis commands (like HashMaps, TTLs, and persistence) are still being implemented. Use it for prototyping, local-first web apps, and experimentation!
+
 ## 🚀 Key Features
 
 - **Multi-Core by Default:** Traditional Redis is strictly single-threaded. Liyab leverages Rust's `tokio` runtime to instantly spawn asynchronous threads for every connection, utilizing 100% of your CPU cores without complex clustering.
@@ -110,6 +114,14 @@ Liyab is built as a highly decoupled Cargo workspace to enforce strict boundarie
 1. **`core-engine`**: A strictly `no_std`-compatible, zero-dependency data store. Features a custom, zero-copy RESP parser and a highly concurrent `Arc<RwLock>` Key-Value store.
 2. **`server-native`**: The multi-threaded TCP and WebSocket backend that wraps the core engine.
 3. **`wasm-edge`**: The Javascript bindings that compile the core engine into the browser.
+
+## 🗺️ Roadmap
+
+Liyab is actively evolving. Here are the features planned for upcoming releases:
+
+- **Advanced Data Types:** Full support for HashMaps (`HSET`, `HGET`), Lists, and Sets.
+- **Data Persistence & TTL:** Key expiration capabilities (`EXPIRE`) and background snapshotting to disk (`BGSAVE`) for disaster recovery.
+- **Extreme Optimizations:** Migrating the core engine from `RwLock` to a sharded `DashMap` to maximize performance on highly-concurrent, write-heavy workloads.
 
 ## 🤝 Contributing
 Liyab is an open-source initiative. We welcome pull requests for new RESP commands (HashMaps, Lists, TTLs), performance optimizations, and client libraries.
