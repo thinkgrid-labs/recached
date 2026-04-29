@@ -14,6 +14,7 @@ pub struct RecachedCache {
 #[wasm_bindgen]
 impl RecachedCache {
     #[wasm_bindgen(constructor)]
+    #[allow(clippy::new_without_default)]
     pub fn new() -> RecachedCache {
         RecachedCache {
             store: Arc::new(KeyValueStore::new()),
