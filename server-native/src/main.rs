@@ -12,16 +12,16 @@ use tokio_tungstenite::tungstenite::Message;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read optional password from environment variable
-    let password = std::env::var("LIYAB_PASSWORD").ok();
+    let password = std::env::var("RECACHED_PASSWORD").ok();
     let global_password = Arc::new(password);
 
     if global_password.is_some() {
         println!("🔒 Authentication is ENABLED. Clients must send 'AUTH <password>'.");
     } else {
-        println!("⚠️ Authentication is DISABLED. (Set LIYAB_PASSWORD to enable).");
+        println!("⚠️ Authentication is DISABLED. (Set RECACHED_PASSWORD to enable).");
     }
 
-    let allowed_ips: Option<Arc<Vec<String>>> = std::env::var("LIYAB_ALLOW_IPS")
+    let allowed_ips: Option<Arc<Vec<String>>> = std::env::var("RECACHED_ALLOW_IPS")
         .ok()
         .map(|s| Arc::new(s.split(',').map(|ip| ip.trim().to_string()).collect()));
 
@@ -35,10 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, _rx) = broadcast::channel::<String>(100);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:6379").await?;
-    println!("🔥 Liyab TCP Server listening on port 6379...");
+    println!("🔥 Recached TCP Server listening on port 6379...");
 
     let ws_listener = TcpListener::bind("127.0.0.1:6380").await?;
-    println!("🌐 Liyab WebSocket Server listening on port 6380...");
+    println!("🌐 Recached WebSocket Server listening on port 6380...");
 
     let store_tcp = Arc::clone(&store);
     let tx_tcp = tx.clone();

@@ -6,22 +6,22 @@ use std::sync::Arc;
 use web_sys::{WebSocket, MessageEvent};
 
 #[wasm_bindgen]
-pub struct LiyabCache {
+pub struct RecachedCache {
     store: Arc<KeyValueStore>,
     ws: Option<WebSocket>,
 }
 
 #[wasm_bindgen]
-impl LiyabCache {
+impl RecachedCache {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> LiyabCache {
-        LiyabCache {
+    pub fn new() -> RecachedCache {
+        RecachedCache {
             store: Arc::new(KeyValueStore::new()),
             ws: None,
         }
     }
 
-    /// Connect to the native Liyab backend via WebSockets
+    /// Connect to the native Recached backend via WebSockets
     pub fn connect(&mut self, url: &str) -> Result<(), JsValue> {
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
@@ -54,7 +54,7 @@ impl LiyabCache {
         Ok(())
     }
 
-    /// Authenticate with the server if LIYAB_PASSWORD is set
+    /// Authenticate with the server if RECACHED_PASSWORD is set
     pub fn auth(&self, password: &str) -> String {
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {
