@@ -1,9 +1,9 @@
 class Recached < Formula
   desc "Blazing fast, multi-core drop-in replacement for Redis"
-  homepage "https://github.com/YOUR_GITHUB_USERNAME/recached"
+  homepage "https://github.com/thinkgrid-labs/recached"
   
   # When you release, you will update these lines with the actual version and URL
-  url "https://github.com/YOUR_GITHUB_USERNAME/recached/releases/download/v0.1.0/recached-macos-arm64"
+  url "https://github.com/thinkgrid-labs/recached/releases/download/v0.1.0/recached-macos-arm64"
   version "0.1.0"
   sha256 "REPLACE_WITH_ACTUAL_SHA256"
   

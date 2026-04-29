@@ -36,14 +36,13 @@ Recached distributes as a single, dependency-free binary.
 ### 1. Docker (Recommended for Production)
 Deploy the ultra-lightweight Recached container securely:
 ```bash
-docker run -p 6379:6379 -p 6380:6380 ghcr.io/yourusername/recached:latest
+docker run -p 6379:6379 -p 6380:6380 ghcr.io/thinkgrid-labs/recached:latest
 ```
 
 ### 2. Homebrew (macOS)
 ```bash
-brew tap yourusername/recached
+brew tap thinkgrid-labs/recached
 brew install recached
-brew services start recached
 ```
 
 ### 3. Cargo (Rust Developers)
