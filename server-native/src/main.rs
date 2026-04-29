@@ -1,11 +1,11 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::sync::Arc;
-use core_engine::store::KeyValueStore;
 use core_engine::cmd::Command;
 use core_engine::resp::Value;
+use core_engine::store::KeyValueStore;
+use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tx_tcp = tx.clone();
     let pass_tcp = Arc::clone(&global_password);
     let allowed_tcp = allowed_ips.clone();
-    
+
     // Spawn the traditional TCP listener thread
     tokio::spawn(async move {
         loop {
@@ -78,7 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn handle_tcp(mut socket: TcpStream, store: Arc<KeyValueStore>, tx: broadcast::Sender<String>, password: Arc<Option<String>>) {
+async fn handle_tcp(
+    mut socket: TcpStream,
+    store: Arc<KeyValueStore>,
+    tx: broadcast::Sender<String>,
+    password: Arc<Option<String>>,
+) {
     let mut buffer = [0; 4096];
     let mut is_authenticated = password.is_none();
 
@@ -89,7 +94,6 @@ async fn handle_tcp(mut socket: TcpStream, store: Arc<KeyValueStore>, tx: broadc
                 let input = &buffer[0..n];
                 if let Ok((value, _)) = Value::parse(input) {
                     if let Ok(cmd) = Command::from_value(value) {
-                        
                         // Authentication Interceptor
                         if let Command::Auth(pwd) = &cmd {
                             if let Some(expected) = &*password {
@@ -100,14 +104,18 @@ async fn handle_tcp(mut socket: TcpStream, store: Arc<KeyValueStore>, tx: broadc
                                     let _ = socket.write_all(b"-ERR invalid password\r\n").await;
                                 }
                             } else {
-                                let _ = socket.write_all(b"-ERR Client sent AUTH, but no password is set\r\n").await;
+                                let _ = socket
+                                    .write_all(b"-ERR Client sent AUTH, but no password is set\r\n")
+                                    .await;
                             }
                             continue;
                         }
 
                         // Block unauthorized commands
                         if !is_authenticated {
-                            let _ = socket.write_all(b"-NOAUTH Authentication required.\r\n").await;
+                            let _ = socket
+                                .write_all(b"-NOAUTH Authentication required.\r\n")
+                                .await;
                             continue;
                         }
 
@@ -119,7 +127,7 @@ async fn handle_tcp(mut socket: TcpStream, store: Arc<KeyValueStore>, tx: broadc
                         };
 
                         let response = store.execute(cmd);
-                        
+
                         // Broadcast if it was a mutation
                         if let Some(msg) = broadcast_msg {
                             let _ = tx.send(msg);
@@ -134,7 +142,12 @@ async fn handle_tcp(mut socket: TcpStream, store: Arc<KeyValueStore>, tx: broadc
     }
 }
 
-async fn handle_ws(socket: TcpStream, store: Arc<KeyValueStore>, tx: broadcast::Sender<String>, password: Arc<Option<String>>) {
+async fn handle_ws(
+    socket: TcpStream,
+    store: Arc<KeyValueStore>,
+    tx: broadcast::Sender<String>,
+    password: Arc<Option<String>>,
+) {
     let ws_stream = match accept_async(socket).await {
         Ok(ws) => ws,
         Err(_) => return, // Failed WS handshake
@@ -152,7 +165,7 @@ async fn handle_ws(socket: TcpStream, store: Arc<KeyValueStore>, tx: broadcast::
                     Some(Ok(Message::Text(text))) => {
                         let parts: Vec<&str> = text.splitn(3, ' ').collect();
                         if parts.is_empty() { continue; }
-                        
+
                         let mut broadcast_msg = None;
                         let cmd = match parts[0].to_uppercase().as_str() {
                             "AUTH" if parts.len() == 2 => {

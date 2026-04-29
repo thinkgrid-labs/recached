@@ -63,7 +63,7 @@ impl Value {
 
     fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
         for i in 0..buffer.len().saturating_sub(1) {
-            if buffer[i] == b'\r' && buffer[i+1] == b'\n' {
+            if buffer[i] == b'\r' && buffer[i + 1] == b'\n' {
                 return Some((&buffer[1..i], i + 2));
             }
         }
@@ -102,18 +102,18 @@ impl Value {
         if let Some((data, head_len)) = Self::read_until_crlf(buffer) {
             let s = String::from_utf8_lossy(data);
             let length: i64 = s.parse().map_err(|_| "Invalid bulk string length")?;
-            
+
             if length == -1 {
                 return Ok((Value::BulkString(None), head_len));
             }
-            
+
             let length = length as usize;
             let end = head_len + length + 2; // +2 for trailing CRLF
             if buffer.len() < end {
                 return Err("Incomplete".to_string());
             }
-            
-            let str_data = buffer[head_len..head_len+length].to_vec();
+
+            let str_data = buffer[head_len..head_len + length].to_vec();
             Ok((Value::BulkString(Some(str_data)), end))
         } else {
             Err("Incomplete".to_string())
@@ -124,18 +124,18 @@ impl Value {
         if let Some((data, mut offset)) = Self::read_until_crlf(buffer) {
             let s = String::from_utf8_lossy(data);
             let count: i64 = s.parse().map_err(|_| "Invalid array length")?;
-            
+
             if count == -1 {
                 return Ok((Value::Array(None), offset));
             }
-            
+
             let mut arr = Vec::new();
             for _ in 0..count {
                 let (val, len) = Self::parse(&buffer[offset..])?;
                 arr.push(val);
                 offset += len;
             }
-            
+
             Ok((Value::Array(Some(arr)), offset))
         } else {
             Err("Incomplete".to_string())

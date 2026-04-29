@@ -1,11 +1,11 @@
+use crate::cmd::Command;
+use crate::resp::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use crate::resp::Value;
-use crate::cmd::Command;
 
 #[derive(Clone, Default)]
 pub struct KeyValueStore {
-    // For the MVP, a simple RwLock HashMap. 
+    // For the MVP, a simple RwLock HashMap.
     // In future phases, this can be sharded for extreme multi-core throughput.
     data: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -28,7 +28,7 @@ impl KeyValueStore {
                 }
             }
             Command::Auth(_) => {
-                // If this hits the store, it means the server interceptor let it through 
+                // If this hits the store, it means the server interceptor let it through
                 // (e.g., already authenticated or no password required).
                 Value::SimpleString("OK".to_string())
             }
@@ -55,9 +55,7 @@ impl KeyValueStore {
                 }
                 Value::Integer(count)
             }
-            Command::Unknown(name) => {
-                Value::Error(format!("ERR unknown command '{}'", name))
-            }
+            Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
         }
     }
 }

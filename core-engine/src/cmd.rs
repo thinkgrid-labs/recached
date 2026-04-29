@@ -28,7 +28,9 @@ impl Command {
                     "PING" => {
                         let msg = if arr.len() > 1 {
                             match &arr[1] {
-                                Value::BulkString(Some(data)) => Some(String::from_utf8_lossy(data).into_owned()),
+                                Value::BulkString(Some(data)) => {
+                                    Some(String::from_utf8_lossy(data).into_owned())
+                                }
                                 Value::SimpleString(s) => Some(s.clone()),
                                 _ => None,
                             }
@@ -39,14 +41,18 @@ impl Command {
                     }
                     "AUTH" => {
                         if arr.len() < 2 {
-                            return Err("ERR wrong number of arguments for 'auth' command".to_string());
+                            return Err(
+                                "ERR wrong number of arguments for 'auth' command".to_string()
+                            );
                         }
                         let pwd = extract_string(&arr[1]).unwrap_or_default();
                         Ok(Command::Auth(pwd))
                     }
                     "SET" => {
                         if arr.len() < 3 {
-                            return Err("ERR wrong number of arguments for 'set' command".to_string());
+                            return Err(
+                                "ERR wrong number of arguments for 'set' command".to_string()
+                            );
                         }
                         let key = extract_string(&arr[1]).unwrap_or_default();
                         let val = extract_string(&arr[2]).unwrap_or_default();
@@ -54,14 +60,18 @@ impl Command {
                     }
                     "GET" => {
                         if arr.len() < 2 {
-                            return Err("ERR wrong number of arguments for 'get' command".to_string());
+                            return Err(
+                                "ERR wrong number of arguments for 'get' command".to_string()
+                            );
                         }
                         let key = extract_string(&arr[1]).unwrap_or_default();
                         Ok(Command::Get(key))
                     }
                     "DEL" => {
                         if arr.len() < 2 {
-                            return Err("ERR wrong number of arguments for 'del' command".to_string());
+                            return Err(
+                                "ERR wrong number of arguments for 'del' command".to_string()
+                            );
                         }
                         let keys = arr[1..].iter().filter_map(extract_string).collect();
                         Ok(Command::Del(keys))

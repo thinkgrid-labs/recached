@@ -1,9 +1,9 @@
-use wasm_bindgen::prelude::*;
-use core_engine::store::KeyValueStore;
 use core_engine::cmd::Command;
 use core_engine::resp::Value;
+use core_engine::store::KeyValueStore;
 use std::sync::Arc;
-use web_sys::{WebSocket, MessageEvent};
+use wasm_bindgen::prelude::*;
+use web_sys::{MessageEvent, WebSocket};
 
 #[wasm_bindgen]
 pub struct RecachedCache {
@@ -25,7 +25,7 @@ impl RecachedCache {
     pub fn connect(&mut self, url: &str) -> Result<(), JsValue> {
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
-        
+
         // Listen for incoming synced commands from the server
         let onmessage_callback = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
@@ -49,7 +49,7 @@ impl RecachedCache {
 
         ws.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
         onmessage_callback.forget(); // Keep the closure alive
-        
+
         self.ws = Some(ws);
         Ok(())
     }
@@ -68,14 +68,14 @@ impl RecachedCache {
     pub fn set(&self, key: &str, value: &str) -> String {
         let cmd = Command::Set(key.to_string(), value.to_string());
         let resp = self.store.execute(cmd);
-        
+
         // Sync to server if connected
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {
                 let _ = ws.send_with_str(&format!("SET {} {}", key, value));
             }
         }
-        
+
         match resp {
             Value::SimpleString(s) => s,
             Value::Error(e) => e,
@@ -97,13 +97,13 @@ impl RecachedCache {
     pub fn del(&self, key: &str) -> i32 {
         let cmd = Command::Del(vec![key.to_string()]);
         let resp = self.store.execute(cmd);
-        
+
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {
                 let _ = ws.send_with_str(&format!("DEL {}", key));
             }
         }
-        
+
         match resp {
             Value::Integer(i) => i as i32,
             _ => 0,
