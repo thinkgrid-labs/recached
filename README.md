@@ -1,8 +1,8 @@
 <div align="center">
   <img src="recached.png" alt="Recached" width="200" />
   <h1>Recached ⚡</h1>
-  <p><b>The Blazing Fast, Multi-Core, Local-First Redis Alternative written in Rust.</b></p>
-  
+  <p><b>A Rust cache server that runs on your backend <em>and</em> inside the browser.</b></p>
+
   <a href="#"><img src="https://img.shields.io/badge/Language-Rust-orange.svg" alt="Rust"></a>
   <a href="#"><img src="https://img.shields.io/badge/Architecture-Multi--Core-blue.svg" alt="Multi-Core"></a>
   <a href="#"><img src="https://img.shields.io/badge/Ecosystem-WebAssembly-yellow.svg" alt="Wasm"></a>
@@ -11,207 +11,181 @@
 
 ---
 
-**RECACHED** (*Rust-Engineered CACHE Daemon*) is a next-generation in-memory data store. It is designed to be a 100% drop-in replacement for Redis that solves the single-threaded bottleneck of traditional caches, while seamlessly extending the database directly into the browser via WebAssembly (Wasm).
+**Recached** is an in-memory cache written in Rust with one idea that existing caches don't have: it compiles to WebAssembly so the same cache engine runs natively on your server *and* directly inside the browser or edge runtime, with the two sides kept in sync over WebSockets.
 
-Whether you are scaling massive backend infrastructure or building real-time, local-first web applications, Recached provides unmatched performance and developer experience.
+On the backend it speaks RESP, so any Redis client works against it today. In the browser, you import it as a `.wasm` module and get zero-latency local reads with automatic background sync to the server — no extra round-trips, no polling, no external state management library.
 
 > [!WARNING]
-> **Status: Active Development**  
-> Recached is in active development and is **not yet ready for production workloads**. The core architecture is fully functional and hardened, but full Redis command coverage (data types, TTL, persistence, pub/sub, transactions) is still being implemented. Use it today for prototyping, local-first web apps, and experimentation.
+> **Status: Active Development**
+> The core protocol and sync architecture are solid, but Recached only implements a small subset of Redis commands today (`GET`, `SET`, `DEL`, `PING`, `AUTH`). It is not yet a Redis replacement for production workloads. Use it for local-first web apps, prototypes, and edge caching experiments.
 
 ---
 
-## 🚀 Key Features
+## Why Recached exists
 
-- **Multi-Core by Default:** Traditional Redis is strictly single-threaded. Recached leverages Rust's `tokio` runtime to handle every connection on a dedicated async task, utilizing 100% of your CPU cores without clustering.
-- **Drop-in Redis Replacement:** Speaks the standard RESP (REdis Serialization Protocol). You do not need to change a single line of your application code or install new client libraries.
-- **Local-First WebAssembly (Wasm):** Recached compiles to a lightweight `.wasm` package. Run the database locally inside the browser or on Edge networks (Cloudflare Workers, Deno Deploy) with zero network latency.
-- **Real-Time WebSocket Sync:** Dual-port architecture that broadcasts state changes instantly between the Native Server and Wasm browser clients using RESP over WebSockets.
-- **Production-Ready Security:** Built-in IP allowlisting, `AUTH` password enforcement with brute-force protection, connection limiting, and structured `tracing` logs on every error path.
+Every caching solution today forces a choice: put the cache on the server (latency on every read) or duplicate state in the client (stale data, cache invalidation hell). Recached removes that choice.
+
+The `core-engine` crate is a pure Rust state machine with no network dependencies. It compiles to native code for the server and to `.wasm` for the browser. Both run the same logic. The WebSocket sync layer keeps them consistent — a `SET` on the server pushes to all connected browser instances automatically.
+
+```
+┌─────────────────┐        RESP (port 6379)        ┌──────────────────┐
+│   Your backend  │ ──────────────────────────────► │  Recached Server │
+└─────────────────┘                                 │  (server-native) │
+                                                    └────────┬─────────┘
+                                                             │ WebSocket
+                                                             │ sync (6380)
+                                                    ┌────────▼─────────┐
+                                                    │  Browser / Edge  │
+                                                    │  (wasm-edge)     │
+                                                    │  local reads: 0ms│
+                                                    └──────────────────┘
+```
 
 ---
 
-## 📦 Installation
+## Getting started
 
-Recached distributes as a single, dependency-free binary.
+### Run the server
 
-### Docker (Recommended)
 ```bash
+# Docker
 docker run -p 6379:6379 -p 6380:6380 ghcr.io/thinkgrid-labs/recached:latest
+
+# Homebrew (macOS)
+brew tap thinkgrid-labs/recached && brew install recached && recached-server
+
+# Cargo
+cargo install recached && recached-server
 ```
 
-### Homebrew (macOS)
-```bash
-brew tap thinkgrid-labs/recached
-brew install recached
-```
-
-### Cargo
-```bash
-cargo install recached
-recached-server
-```
-
----
-
-## 💻 Usage
-
-### Backend (Redis-compatible TCP — port 6379)
-
-Point any standard Redis client directly at Recached — no code changes required.
+### Use from your backend (any Redis client, port 6379)
 
 ```javascript
 import Redis from 'ioredis';
 
-const redis = new Redis('redis://127.0.0.1:6379');
-
-await redis.set('user:1', 'John Doe');
-console.log(await redis.get('user:1')); // "John Doe"
+const cache = new Redis('redis://127.0.0.1:6379');
+await cache.set('user:1', 'Alice');
+console.log(await cache.get('user:1')); // "Alice"
 ```
 
-### Frontend / Edge (WebAssembly — port 6380)
-
-Import the cache into the browser for zero-latency local reads with automatic background sync to the server.
+### Use from the browser (WebAssembly, port 6380)
 
 ```javascript
 import init, { RecachedCache } from 'recached-edge';
 
 await init();
-
 const cache = new RecachedCache();
-cache.connect("ws://127.0.0.1:6380");
 
-cache.set("theme", "dark");       // instant local write + syncs to server
-console.log(cache.get("theme"));  // "dark" — read from local WASM memory
+// Connects to the server and syncs state changes in the background
+cache.connect('ws://127.0.0.1:6380');
+
+cache.set('theme', 'dark');        // writes locally + pushes to server
+console.log(cache.get('theme'));   // reads from local WASM memory — 0ms
 ```
+
+Any `SET` or `DEL` on the server side is automatically pushed to all connected browser instances. Any write from the browser is pushed to the server and fanned out to other browser clients.
 
 ---
 
-## 🔒 Security Configuration
-
-Recached binds to `localhost` only by default. Lock it down further for production:
+## Configuration
 
 ```bash
-RECACHED_PASSWORD="super_secret_password" \
-RECACHED_ALLOW_IPS="127.0.0.1,10.0.0.55" \
-RECACHED_MAX_KEYS="1000000" \
+RECACHED_PASSWORD="secret"          \  # require AUTH; disconnects after 5 wrong attempts
+RECACHED_ALLOW_IPS="127.0.0.1"     \  # comma-separated allowlist (invalid entries are logged + skipped)
+RECACHED_MAX_KEYS="1000000"         \  # hard key cap; SET errors when reached
+RUST_LOG="info"                     \  # log level: error / warn / info / debug
 recached-server
 ```
 
-| Variable | Description |
+---
+
+## Architecture
+
+Three crates with hard dependency boundaries:
+
+| Crate | Role |
 |---|---|
-| `RECACHED_PASSWORD` | Require all clients to authenticate with `AUTH <password>`. Connections are dropped after 5 wrong attempts. |
-| `RECACHED_ALLOW_IPS` | Comma-separated IP allowlist. Invalid entries are logged and skipped. |
-| `RECACHED_MAX_KEYS` | Hard cap on total stored keys. `SET` returns an error once the limit is hit. |
-| `RUST_LOG` | Log level (`info`, `debug`, `warn`). Defaults to `info`. |
+| `core-engine` | Pure state machine — no networking, no I/O. RESP parser (depth-limited), typed command dispatch, `Arc<RwLock<HashMap>>` store with optional key cap. Compiles to both native and `wasm32`. |
+| `server-native` | Tokio TCP server (port 6379) + WebSocket server (port 6380). Persistent read buffers handle fragmented RESP. Connection semaphore, auth rate-limiting, sender-ID broadcast filter, structured `tracing` logging throughout. |
+| `wasm-edge` | `wasm-bindgen` JS bindings. Local zero-latency reads, RESP-over-WebSocket sync with the server. Closure lifecycle is managed correctly — reconnecting doesn't leak memory. |
 
 ---
 
-## 🏗️ Architecture
+## What works today
 
-Recached is a Cargo workspace with hard boundaries between the state machine and the network layer:
-
-| Crate | Description |
-|---|---|
-| `core-engine` | Zero-dependency, no-network state machine. Custom length-prefixed RESP parser with depth-limited array recursion. Thread-safe `Arc<RwLock<HashMap>>` KV store. |
-| `server-native` | Multi-core TCP (port 6379) and WebSocket (port 6380) server built on `tokio`. Persistent read buffers, connection semaphore, auth rate-limiting, structured `tracing` logging. |
-| `wasm-edge` | `wasm-bindgen` browser bindings. Zero-latency local reads with RESP-over-WebSocket background sync. Proper closure lifecycle management. |
-
----
-
-## 🗺️ Roadmap
-
-### 🔲 Redis String & Key Parity
-Full coverage of Redis string commands and key utilities — the foundation for a true drop-in replacement.
-
-**String commands**
-- `APPEND`, `STRLEN`
-- `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`
-- `MGET`, `MSET`, `MSETNX`
-- `GETSET`, `GETDEL`, `GETEX`
-- `SETNX`, `SETEX`, `PSETEX`
-- `SET` options: `EX`, `PX`, `NX`, `XX`, `KEEPTTL`, `GET`
-
-**TTL & expiry**
-- `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`
-- `TTL`, `PTTL`, `PERSIST`
-- Background lazy expiry (scan-on-read + periodic sweep)
-
-**Key utilities**
-- `EXISTS` (multi-key), `TYPE`, `RENAME`, `RENAMENX`, `COPY`
-- `SCAN`, `KEYS` (pattern matching)
-- `RANDOMKEY`, `DBSIZE`
-- `FLUSHDB`, `FLUSHALL`
-- `UNLINK` (non-blocking async delete)
+- `PING`, `SET`, `GET`, `DEL`, `AUTH`
+- RESP protocol — full parser/serializer, handles fragmentation, depth-limited (no stack-overflow DoS)
+- TCP (port 6379) compatible with any Redis client
+- WebSocket sync (port 6380) between server and browser WASM instances
+- Sender-ID filter: browser clients don't double-apply their own mutations
+- `RECACHED_PASSWORD` + brute-force lockout after 5 failures
+- `RECACHED_ALLOW_IPS` with validated IP parsing
+- `RECACHED_MAX_KEYS` memory cap
+- Connection semaphore (max 1024 concurrent)
+- Structured `tracing` logs
 
 ---
 
-### 🔲 Redis Data Structures
-Full implementation of all Redis collection types.
+## Roadmap
 
-**Hash** — `HSET`, `HGET`, `HMGET`, `HGETALL`, `HKEYS`, `HVALS`, `HDEL`, `HEXISTS`, `HLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSCAN`
+### Redis command parity
 
-**List** — `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LINSERT`, `LREM`, `LTRIM`, `LMOVE`, `BLPOP`, `BRPOP`
+The goal is full behavioral compatibility so Recached can be a genuine drop-in for Redis. This is unglamorous but necessary.
 
-**Set** — `SADD`, `SMEMBERS`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SPOP`, `SRANDMEMBER`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SSCAN`
+**Phase 2 — Strings & TTL**
+- String ops: `APPEND`, `STRLEN`, `INCR`/`DECR`, `MGET`/`MSET`, `GETSET`, `SETNX`/`SETEX`, `SET EX/PX/NX/XX`
+- Expiry: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, background lazy eviction
+- Key ops: `EXISTS`, `TYPE`, `RENAME`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`, `UNLINK`
 
-**Sorted Set** — `ZADD`, `ZSCORE`, `ZMSCORE`, `ZRANK`, `ZREVRANK`, `ZRANGE`, `ZRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGE`, `ZREM`, `ZCARD`, `ZCOUNT`, `ZINCRBY`, `ZINTERSTORE`, `ZUNIONSTORE`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`
+**Phase 3 — Collections**
+- Hash: `HSET`, `HGET`, `HGETALL`, `HDEL`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`
+- List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `BLPOP`, `BRPOP`
+- Set: `SADD`, `SMEMBERS`, `SREM`, `SCARD`, `SISMEMBER`, `SINTER`, `SUNION`, `SDIFF`
+- Sorted Set: `ZADD`, `ZRANGE`, `ZSCORE`, `ZRANK`, `ZREM`, `ZCARD`, `ZINCRBY`
 
----
-
-### 🔲 Redis Advanced Features
-Achieving full behavioral parity with Redis.
-
-**Pub/Sub** — `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBSUB`
-
-**Transactions** — `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`
-
-**Persistence**
-- RDB snapshotting: `BGSAVE`, `SAVE`, `LASTSAVE`
-- AOF (Append Only File) with configurable `fsync` policy
-
-**Server commands** — `INFO`, `DEBUG`, `CONFIG GET/SET/REWRITE`, `COMMAND`, `COMMAND COUNT`, `COMMAND INFO`, `SLOWLOG`, `MONITOR`
-
-**Scripting** — `EVAL`, `EVALSHA`, `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH`
-
-**Replication** — `REPLICAOF`, `SLAVEOF`, read-replica propagation
+**Phase 4 — Advanced Redis**
+- Pub/Sub: `SUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE`
+- Transactions: `MULTI`, `EXEC`, `DISCARD`, `WATCH`
+- Persistence: RDB snapshots (`BGSAVE`), AOF with configurable `fsync`
+- Replication: `REPLICAOF`, read-replica propagation
+- Scripting: `EVAL`, `EVALSHA`
+- Server: `INFO`, `CONFIG GET/SET`, `COMMAND`, `SLOWLOG`
 
 ---
 
-### 🔲 Beyond Redis
-Features that are architecturally impossible in Redis but native to Recached.
+### Beyond Redis
+
+These are things Redis either can't do or requires paid modules/plugins for.
 
 **Performance**
-- [ ] **Sharded `DashMap` core** — replace `RwLock<HashMap>` with a lock-striped concurrent map; eliminates write contention on multi-core hardware entirely
-- [ ] **RESP3 protocol** — richer types (maps, sets, doubles, attributes) with zero extra parsing overhead
-- [ ] **Zero-copy command dispatch** — avoid heap allocation on the hot path for `GET`/`SET`
+- [ ] **Sharded `DashMap` core** — swap `RwLock<HashMap>` for a lock-striped concurrent map; removes write bottleneck on high-core-count machines
+- [ ] **RESP3 support** — richer native types (maps, doubles, blob errors) without client workarounds
 
-**Security & Ops**
-- [ ] **Native TLS/mTLS** — encrypt TCP and WebSocket connections without a sidecar proxy
-- [ ] **Built-in Prometheus metrics** — `/metrics` endpoint exposing hit rate, latency percentiles, memory usage, and connection counts; no plugin required
-- [ ] **Pluggable eviction policies** — LRU, LFU, TTL-priority, and ARC available via `RECACHED_EVICTION=lfu`
+**Ops**
+- [ ] **Native TLS** — encrypt TCP and WebSocket connections without a sidecar
+- [ ] **Built-in Prometheus metrics** — hit rate, latency percentiles, memory, connection counts at `/metrics`; no module needed
+- [ ] **Pluggable eviction** — LRU, LFU, TTL-priority, ARC via `RECACHED_EVICTION=lfu`
 
-**New Primitives** (no Redis equivalent)
-- [ ] **Native JSON type** — `JSET`, `JGET`, `JMERGE`, `JPATCH`, `JDEL` with JSONPath queries; no module required
-- [ ] **Rate-limiting commands** — `RLSET key limit window`, `RLCHECK key` backed by a sliding-window counter; replace hand-rolled Lua scripts in Redis
-- [ ] **Observable keys** — `WATCH key` over WebSocket pushes a RESP message to the subscriber on every mutation; reactive data binding without polling
-- [ ] **WASM server-side scripting** — run `.wasm` modules as stored procedures; replaces Redis Lua scripting with a sandboxed, type-safe, multi-language alternative
-- [ ] **Multi-region CRDTs** — active-active replication using conflict-free replicated data types; eventual consistency across regions without a coordinator
+**New primitives**
+- [ ] **Native JSON type** — `JSET`, `JGET`, `JMERGE` with JSONPath; no RedisJSON module
+- [ ] **Rate-limiting commands** — `RLSET key limit window` / `RLCHECK key`; replaces hand-rolled Lua scripts
+- [ ] **Observable keys** — `WATCH key` over WebSocket delivers a push on every mutation; reactive bindings without polling
+- [ ] **WASM server-side scripting** — run `.wasm` stored procedures instead of Lua; sandboxed, multi-language
 
-**Edge & Browser**
-- [ ] **Cloudflare Workers / Deno Deploy targets** — WASI build profile with `wasm32-wasip1` for true serverless edge caching
-- [ ] **Offline-first sync** — IndexedDB-backed persistence in the WASM layer; cache survives browser refresh and syncs delta on reconnect
-- [ ] **Native TypeScript SDK** — typed client generated from the command schema; zero-overhead bindings via the WASM module (no JSON serialization)
+**Edge & browser**
+- [ ] **WASI target** — `wasm32-wasip1` build for Cloudflare Workers and Deno Deploy
+- [ ] **Offline-first WASM** — IndexedDB persistence layer; cache survives refresh and syncs delta on reconnect
+- [ ] **Typed TypeScript SDK** — generated from the command schema, zero-overhead WASM bindings
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
-Recached is open source. The highest-impact contribution areas right now are:
+The most useful contributions right now:
 
-1. **Commands** — string operations and TTL expiry are the most-requested missing features
-2. **Benchmarks** — `redis-benchmark` comparisons against Redis 7 on multi-core hardware
-3. **Client libraries** — Python, Go, and Java clients that speak RESP to port 6379
-4. **WASM examples** — React, Vue, and SvelteKit demos using `recached-edge`
+1. **Phase 2 commands** — `INCR`, `EXPIRE`, `TTL` are the most-requested missing pieces
+2. **Benchmarks** — `redis-benchmark` against Redis 7 on multi-core hardware (results welcome either way)
+3. **Client examples** — React, Vue, or SvelteKit demos using `recached-edge`
+4. **Bug reports** — edge cases in the RESP parser or WebSocket sync
 
-Open a PR or file an issue to get started.
+Open a PR or file an issue.

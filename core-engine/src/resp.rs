@@ -78,14 +78,20 @@ impl Value {
 
     fn parse_simple_string(buffer: &[u8]) -> Result<(Value, usize), String> {
         match Self::read_until_crlf(buffer) {
-            Some((data, len)) => Ok((Value::SimpleString(String::from_utf8_lossy(data).into_owned()), len)),
+            Some((data, len)) => Ok((
+                Value::SimpleString(String::from_utf8_lossy(data).into_owned()),
+                len,
+            )),
             None => Err("Incomplete".to_string()),
         }
     }
 
     fn parse_error(buffer: &[u8]) -> Result<(Value, usize), String> {
         match Self::read_until_crlf(buffer) {
-            Some((data, len)) => Ok((Value::Error(String::from_utf8_lossy(data).into_owned()), len)),
+            Some((data, len)) => Ok((
+                Value::Error(String::from_utf8_lossy(data).into_owned()),
+                len,
+            )),
             None => Err("Incomplete".to_string()),
         }
     }
@@ -94,7 +100,9 @@ impl Value {
         match Self::read_until_crlf(buffer) {
             Some((data, len)) => {
                 let s = String::from_utf8_lossy(data);
-                let i = s.parse::<i64>().map_err(|_| "Invalid integer format".to_string())?;
+                let i = s
+                    .parse::<i64>()
+                    .map_err(|_| "Invalid integer format".to_string())?;
                 Ok((Value::Integer(i), len))
             }
             None => Err("Incomplete".to_string()),
@@ -105,7 +113,9 @@ impl Value {
         match Self::read_until_crlf(buffer) {
             Some((data, head_len)) => {
                 let s = String::from_utf8_lossy(data);
-                let length: i64 = s.parse().map_err(|_| "Invalid bulk string length".to_string())?;
+                let length: i64 = s
+                    .parse()
+                    .map_err(|_| "Invalid bulk string length".to_string())?;
 
                 if length == -1 {
                     return Ok((Value::BulkString(None), head_len));
@@ -226,12 +236,18 @@ mod tests {
         assert_eq!(Value::parse(b""), Err("Incomplete".to_string()));
         assert_eq!(Value::parse(b"+OK"), Err("Incomplete".to_string())); // missing \r\n
         assert_eq!(Value::parse(b"$5\r\nhell"), Err("Incomplete".to_string())); // truncated bulk
-        assert_eq!(Value::parse(b"*2\r\n+OK\r\n"), Err("Incomplete".to_string())); // array missing 2nd element
+        assert_eq!(
+            Value::parse(b"*2\r\n+OK\r\n"),
+            Err("Incomplete".to_string())
+        ); // array missing 2nd element
     }
 
     #[test]
     fn invalid_resp_type_byte() {
-        assert_eq!(Value::parse(b"!garbage"), Err("Invalid RESP type".to_string()));
+        assert_eq!(
+            Value::parse(b"!garbage"),
+            Err("Invalid RESP type".to_string())
+        );
     }
 
     #[test]

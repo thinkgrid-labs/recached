@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn del_multiple_keys() {
         let cmd = Command::from_value(array(&["DEL", "a", "b", "c"])).unwrap();
-        assert_eq!(cmd, Command::Del(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        assert_eq!(
+            cmd,
+            Command::Del(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
     }
 
     #[test]

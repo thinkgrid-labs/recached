@@ -82,7 +82,9 @@ impl RecachedCache {
 
     /// Set a key-value pair locally and sync to the server.
     pub fn set(&self, key: &str, value: &str) -> String {
-        let resp = self.store.execute(Command::Set(key.to_string(), value.to_string()));
+        let resp = self
+            .store
+            .execute(Command::Set(key.to_string(), value.to_string()));
 
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {

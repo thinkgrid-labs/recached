@@ -63,7 +63,10 @@ fn process_auth(
                 (false, b"-ERR invalid password\r\n".to_vec())
             }
         }
-        None => (false, b"-ERR Client sent AUTH, but no password is set\r\n".to_vec()),
+        None => (
+            false,
+            b"-ERR Client sent AUTH, but no password is set\r\n".to_vec(),
+        ),
     }
 }
 
@@ -297,10 +300,7 @@ async fn handle_tcp(
                         Err(ref e) if e == "Incomplete" => break, // need more bytes
                         Err(e) => {
                             warn!("TCP protocol error: {}", e);
-                            if let Err(we) = socket
-                                .write_all(b"-ERR Protocol error\r\n")
-                                .await
-                            {
+                            if let Err(we) = socket.write_all(b"-ERR Protocol error\r\n").await {
                                 warn!("TCP write error: {}", we);
                             }
                             buf.clear();
