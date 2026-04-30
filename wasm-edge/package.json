@@ -1,0 +1,19 @@
+{
+  "name": "recached-edge",
+  "description": "Browser and edge WebAssembly client for Recached — zero-latency local cache with automatic server sync",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thinkgrid-labs/recached"
+  },
+  "homepage": "https://github.com/thinkgrid-labs/recached",
+  "bugs": "https://github.com/thinkgrid-labs/recached/issues",
+  "keywords": [
+    "cache",
+    "wasm",
+    "webassembly",
+    "redis",
+    "local-first",
+    "edge"
+  ],
+  "license": "MIT"
+}

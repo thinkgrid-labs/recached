@@ -37,7 +37,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Build Wasm package
-        run: wasm-pack build wasm-edge --target web --release
+        run: wasm-pack build wasm-edge --target web --release --out-name recached-edge
 
       - name: Publish to NPM
         env:
