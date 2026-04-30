@@ -1,29 +1,39 @@
-# ---------------------------------------------------
-# Stage 1: Build the Rust Binary
-# ---------------------------------------------------
-FROM rust:1.75-slim-bookworm as builder
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
+# Use a recent stable image — edition 2024 and let-chains require Rust ≥ 1.88.
+FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /app
-# Copy the entire workspace
-COPY . .
 
-# Build the native server in release mode
-RUN cargo build --release --manifest-path server-native/Cargo.toml
+# Cache dependencies separately so they aren't re-downloaded on every code change.
+COPY Cargo.toml Cargo.lock ./
+COPY core-engine/Cargo.toml   core-engine/Cargo.toml
+COPY server-native/Cargo.toml server-native/Cargo.toml
+COPY wasm-edge/Cargo.toml     wasm-edge/Cargo.toml
 
-# ---------------------------------------------------
-# Stage 2: Minimal Runtime Image
-# ---------------------------------------------------
+# Dummy source files so `cargo fetch` / the dep-only build can resolve the workspace.
+RUN mkdir -p core-engine/src server-native/src wasm-edge/src && \
+    echo "fn main() {}" > server-native/src/main.rs && \
+    echo "" > core-engine/src/lib.rs && \
+    echo "" > wasm-edge/src/lib.rs && \
+    cargo build --release --package server-native && \
+    rm -rf core-engine/src server-native/src wasm-edge/src
+
+# Now copy real source and do the real build (only changed crates recompile).
+COPY core-engine/src   core-engine/src
+COPY server-native/src server-native/src
+
+RUN cargo build --release --package server-native
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
-# Install CA certificates in case Recached ever needs to make outbound HTTPS requests
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/server-native /usr/local/bin/recached-server
 
-# Expose the standard Redis port (6379) and the WebSocket port (6380)
 EXPOSE 6379
 EXPOSE 6380
 
-# Run the server
 CMD ["recached-server"]
