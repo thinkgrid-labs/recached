@@ -39,6 +39,19 @@ jobs:
       - name: Build Wasm package
         run: wasm-pack build wasm-edge --target web --release --out-name recached-edge
 
+      - name: Set package name
+        # wasm-pack derives the npm name from the crate name, ignoring any custom package.json.
+        # Patch the generated pkg/package.json to use the correct published name.
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = 'wasm-edge/pkg/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.name = 'recached-edge';
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            console.log('Package name set to:', pkg.name);
+          "
+
       - name: Publish to NPM
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

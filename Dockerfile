@@ -10,13 +10,15 @@ COPY core-engine/Cargo.toml   core-engine/Cargo.toml
 COPY server-native/Cargo.toml server-native/Cargo.toml
 COPY wasm-edge/Cargo.toml     wasm-edge/Cargo.toml
 
-# Dummy source files so `cargo fetch` / the dep-only build can resolve the workspace.
+# Dummy source files so the dep-only build can resolve the workspace.
+# wasm-edge/src is kept as a stub — Cargo parses it as a workspace member
+# even when only building server-native, so lib.rs must exist.
 RUN mkdir -p core-engine/src server-native/src wasm-edge/src && \
     echo "fn main() {}" > server-native/src/main.rs && \
     echo "" > core-engine/src/lib.rs && \
     echo "" > wasm-edge/src/lib.rs && \
     cargo build --release --package server-native && \
-    rm -rf core-engine/src server-native/src wasm-edge/src
+    rm -rf core-engine/src server-native/src
 
 # Now copy real source and do the real build (only changed crates recompile).
 COPY core-engine/src   core-engine/src
