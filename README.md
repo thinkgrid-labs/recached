@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="recached.png" alt="Recached" width="200" />
   <h1>Recached ⚡</h1>
   <p><b>The Blazing Fast, Multi-Core, Local-First Redis Alternative written in Rust.</b></p>
   
