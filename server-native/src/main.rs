@@ -4,11 +4,11 @@ use core_engine::store::KeyValueStore;
 use futures_util::{SinkExt, StreamExt};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::{Semaphore, broadcast};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
@@ -152,11 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match tcp_listener.accept().await {
                 Ok((socket, addr)) => {
-                    if let Some(allowed) = &allowed_tcp {
-                        if !allowed.contains(&addr.ip()) {
-                            debug!("TCP: rejected IP {}", addr.ip());
-                            continue;
-                        }
+                    if let Some(allowed) = &allowed_tcp
+                        && !allowed.contains(&addr.ip())
+                    {
+                        debug!("TCP: rejected IP {}", addr.ip());
+                        continue;
                     }
                     let permit = match Arc::clone(&sem_tcp).try_acquire_owned() {
                         Ok(p) => p,
@@ -181,11 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match ws_listener.accept().await {
             Ok((socket, addr)) => {
-                if let Some(allowed) = &allowed_ips {
-                    if !allowed.contains(&addr.ip()) {
-                        debug!("WS: rejected IP {}", addr.ip());
-                        continue;
-                    }
+                if let Some(allowed) = &allowed_ips
+                    && !allowed.contains(&addr.ip())
+                {
+                    debug!("WS: rejected IP {}", addr.ip());
+                    continue;
                 }
                 let permit = match Arc::clone(&semaphore).try_acquire_owned() {
                     Ok(p) => p,
@@ -285,10 +285,10 @@ async fn handle_tcp(
                             };
 
                             // Broadcast first so peers are notified before local state advances.
-                            if let Some(ref msg) = broadcast_msg {
-                                if let Err(e) = tx.send((0, msg.clone())) {
-                                    debug!("TCP broadcast had no WS receivers: {}", e);
-                                }
+                            if let Some(ref msg) = broadcast_msg
+                                && let Err(e) = tx.send((0, msg.clone()))
+                            {
+                                debug!("TCP broadcast had no WS receivers: {}", e);
                             }
 
                             let response = store.execute(cmd);
@@ -415,10 +415,10 @@ async fn handle_ws(
                             _ => None,
                         };
 
-                        if let Some(ref b_msg) = broadcast_msg {
-                            if let Err(e) = tx.send((conn_id, b_msg.clone())) {
-                                debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
-                            }
+                        if let Some(ref b_msg) = broadcast_msg
+                            && let Err(e) = tx.send((conn_id, b_msg.clone()))
+                        {
+                            debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
                         }
 
                         let response = store.execute(cmd);
