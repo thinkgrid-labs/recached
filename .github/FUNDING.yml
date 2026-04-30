@@ -1,0 +1,22 @@
+# Recached — Funding / Sponsor links
+# These appear under the "Sponsor" button on the GitHub repository page.
+# Fill in your username for each platform you use. Remove or comment out the rest.
+
+# GitHub Sponsors (https://github.com/sponsors/<username>)
+github: thinkgrid-labs
+
+# Ko-fi (https://ko-fi.com/<username>)
+# ko_fi: yourname
+
+# Buy Me a Coffee (https://buymeacoffee.com/<username>)
+# buy_me_a_coffee: yourname
+
+# Patreon (https://patreon.com/<username>)
+# patreon: yourname
+
+# Open Collective (https://opencollective.com/<slug>)
+# open_collective: recached
+
+# Custom URLs (up to 4, e.g. a Stripe payment link or personal site)
+# custom:
+#   - https://yoursite.com/sponsor
