@@ -39,6 +39,9 @@ jobs:
       - name: Build Wasm package
         run: wasm-pack build wasm-edge --target web --release --out-name recached-edge
 
+      - name: Copy LICENSE into package
+        run: cp LICENSE.md wasm-edge/pkg/LICENSE.md
+
       - name: Set package name
         # wasm-pack derives the npm name from the crate name, ignoring any custom package.json.
         # Patch the generated pkg/package.json to use the correct published name.

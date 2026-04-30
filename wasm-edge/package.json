@@ -15,5 +15,6 @@
     "local-first",
     "edge"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "licenseFile": "../LICENSE.md"
 }

@@ -11,6 +11,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["ThinkGrid Labs"]
+repository = "https://github.com/thinkgrid-labs/recached"
 
 # ── Shared dependency versions ────────────────────────────────────────────────
 # Members inherit with:  tokio.workspace = true  (add features per-crate if needed)
