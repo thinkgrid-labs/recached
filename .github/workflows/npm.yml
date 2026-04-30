@@ -3,35 +3,43 @@ name: Publish Wasm Package to NPM
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-publish:
+    name: Build and publish recached-edge to NPM
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "recached-wasm-cache"
+
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
-        
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
-          registry-url: 'https://registry.npmjs.org'
-          
-      - name: Build Wasm Package
-        run: |
-          cd wasm-edge
-          wasm-pack build --target web
-          
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build Wasm package
+        run: wasm-pack build wasm-edge --target web --release
+
       - name: Publish to NPM
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          echo "Ready to publish to NPM!"
-          # To enable actual publishing, uncomment the line below:
-          # cd wasm-edge/pkg && npm publish --access public
+        run: cd wasm-edge/pkg && npm publish --access public

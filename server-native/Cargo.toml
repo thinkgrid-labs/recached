@@ -1,12 +1,12 @@
 [package]
-name = "server-native"
-version = "0.1.0"
-edition = "2021"
+name    = "server-native"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.29.0"
-futures-util = "0.3"
-core-engine = { path = "../core-engine" }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+core-engine.workspace       = true
+tokio.workspace             = true
+tokio-tungstenite.workspace = true
+futures-util.workspace      = true
+tracing.workspace           = true
+tracing-subscriber.workspace = true

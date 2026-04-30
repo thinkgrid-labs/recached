@@ -3,47 +3,65 @@ name: Release Binaries
 on:
   push:
     tags:
-      - 'v*' # Trigger on version tags like v1.0.0
+      - "v*"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-upload:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: recached-linux-amd64
-          - os: macos-latest
+            artifact: recached-linux-amd64
+
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: recached-linux-arm64
+
+          - runner: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: recached-macos-amd64
-          - os: macos-14 # ARM64 runner for Apple Silicon
+            artifact: recached-macos-amd64
+
+          - runner: macos-14
             target: aarch64-apple-darwin
-            artifact_name: recached-macos-arm64
-          - os: windows-latest
+            artifact: recached-macos-arm64
+
+          - runner: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: recached-windows-amd64.exe
+            artifact: recached-windows-amd64.exe
+            binary_suffix: .exe
 
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Rust Toolchain
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-          
-      - name: Build Release Binary
-        run: cargo build --release --manifest-path server-native/Cargo.toml --target ${{ matrix.target }}
 
-      - name: Upload Binary to GitHub Releases
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "recached-release-${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo build --release --package server-native --target ${{ matrix.target }}
+
+      - name: Upload binary to GitHub Release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/${{ matrix.target }}/release/server-native${{ matrix.os == 'windows-latest' && '.exe' || '' }}
-          asset_name: ${{ matrix.artifact_name }}
+          file: target/${{ matrix.target }}/release/server-native${{ matrix.binary_suffix || '' }}
+          asset_name: ${{ matrix.artifact }}
           tag: ${{ github.ref }}
           overwrite: true

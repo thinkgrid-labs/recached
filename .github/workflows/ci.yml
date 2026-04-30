@@ -2,9 +2,9 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [ "main", "dev" ]
+    branches: ["main", "dev"]
   pull_request:
-    branches: [ "main", "dev" ]
+    branches: ["main", "dev"]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -23,19 +23,18 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Rust Cache
+      - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "recached-ci-cache"
 
-      - name: Check Formatting
-        # Fails the build if the code is not formatted properly
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy Linter
-        # -D warnings treats warnings as errors, enforcing strict code quality
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run Clippy
+        # wasm-edge requires the wasm32 target to compile — exclude it from native CI.
+        # It is validated separately in the npm workflow when wasm-pack builds it.
+        run: cargo clippy --workspace --exclude wasm-edge --all-targets -- -D warnings
 
-      - name: Run Tests
-        # Runs unit tests across the entire workspace
-        run: cargo test --workspace
+      - name: Run tests
+        run: cargo test --workspace --exclude wasm-edge

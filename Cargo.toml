@@ -2,6 +2,32 @@
 members = [
     "core-engine",
     "server-native",
-    "wasm-edge"
+    "wasm-edge",
 ]
 resolver = "2"
+
+# ── Single source of truth for all crate versions ────────────────────────────
+# Members inherit with:  version.workspace = true  /  edition.workspace = true
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# ── Shared dependency versions ────────────────────────────────────────────────
+# Members inherit with:  tokio.workspace = true  (add features per-crate if needed)
+[workspace.dependencies]
+# internal
+core-engine = { path = "core-engine" }
+
+# async runtime
+tokio          = { version = "1",     features = ["full"] }
+tokio-tungstenite = "0.29.0"
+futures-util   = "0.3"
+
+# observability
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# wasm
+wasm-bindgen = "0.2.92"
+js-sys       = "0.3.69"
+web-sys      = "0.3.69"

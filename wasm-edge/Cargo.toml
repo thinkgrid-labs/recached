@@ -1,21 +1,21 @@
 [package]
-name = "wasm-edge"
-version = "0.1.0"
-edition = "2021"
+name    = "wasm-edge"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wasm-bindgen = "0.2.92"
-js-sys = "0.3.69"
-core-engine = { path = "../core-engine" }
+core-engine.workspace  = true
+wasm-bindgen.workspace = true
+js-sys.workspace       = true
 
 [dependencies.web-sys]
-version = "0.3.69"
+workspace = true
 features = [
-  "WebSocket",
-  "MessageEvent",
-  "ErrorEvent",
-  "console",
+    "WebSocket",
+    "MessageEvent",
+    "ErrorEvent",
+    "console",
 ]
