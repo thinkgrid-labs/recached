@@ -8,3 +8,5 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.29.0"
 futures-util = "0.3"
 core-engine = { path = "../core-engine" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

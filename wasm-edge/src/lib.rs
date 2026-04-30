@@ -5,10 +5,21 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, WebSocket};
 
+/// Encodes parts as a RESP bulk-string array, e.g. `["SET","k","v"]` → `*3\r\n$3\r\nSET\r\n…`.
+fn to_resp(parts: &[&str]) -> String {
+    let mut s = format!("*{}\r\n", parts.len());
+    for part in parts {
+        s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
+    }
+    s
+}
+
 #[wasm_bindgen]
 pub struct RecachedCache {
     store: Arc<KeyValueStore>,
     ws: Option<WebSocket>,
+    // Held here so it is dropped (and the JS callback unregistered) when connect() is called again.
+    _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
 }
 
 impl Default for RecachedCache {
@@ -24,61 +35,58 @@ impl RecachedCache {
         RecachedCache {
             store: Arc::new(KeyValueStore::new()),
             ws: None,
+            _onmessage: None,
         }
     }
 
-    /// Connect to the native Recached backend via WebSockets
+    /// Connect to the native Recached backend via WebSockets.
+    /// Calling this a second time cleanly replaces the previous connection.
     pub fn connect(&mut self, url: &str) -> Result<(), JsValue> {
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
 
-        // Listen for incoming synced commands from the server
-        let onmessage_callback = Closure::wrap(Box::new(move |e: MessageEvent| {
+        // Incoming messages from the server are RESP-encoded mutation commands (SET / DEL).
+        let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
-                let text_str = String::from(text);
-                let parts: Vec<&str> = text_str.splitn(3, ' ').collect();
-                if !parts.is_empty() {
-                    match parts[0].to_uppercase().as_str() {
-                        "SET" if parts.len() == 3 => {
-                            let cmd = Command::Set(parts[1].to_string(), parts[2].to_string());
-                            store_clone.execute(cmd);
+                let s = String::from(text);
+                if let Ok((value, _)) = Value::parse(s.as_bytes()) {
+                    if let Ok(cmd) = Command::from_value(value) {
+                        match cmd {
+                            Command::Set(_, _) | Command::Del(_) => {
+                                store_clone.execute(cmd);
+                            }
+                            _ => {}
                         }
-                        "DEL" if parts.len() == 2 => {
-                            let cmd = Command::Del(vec![parts[1].to_string()]);
-                            store_clone.execute(cmd);
-                        }
-                        _ => {}
                     }
                 }
             }
         }) as Box<dyn FnMut(MessageEvent)>);
 
-        ws.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
-        onmessage_callback.forget(); // Keep the closure alive
+        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
+        // Store the closure in the struct — this keeps it alive and drops the old one.
+        self._onmessage = Some(onmessage);
         self.ws = Some(ws);
         Ok(())
     }
 
-    /// Authenticate with the server if RECACHED_PASSWORD is set
+    /// Send an AUTH command to the server. The response arrives asynchronously via onmessage.
     pub fn auth(&self, password: &str) -> String {
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {
-                let _ = ws.send_with_str(&format!("AUTH {}", password));
+                let _ = ws.send_with_str(&to_resp(&["AUTH", password]));
             }
         }
         "OK".to_string()
     }
 
-    /// Set a key-value pair and sync to server
+    /// Set a key-value pair locally and sync to the server.
     pub fn set(&self, key: &str, value: &str) -> String {
-        let cmd = Command::Set(key.to_string(), value.to_string());
-        let resp = self.store.execute(cmd);
+        let resp = self.store.execute(Command::Set(key.to_string(), value.to_string()));
 
-        // Sync to server if connected
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {
-                let _ = ws.send_with_str(&format!("SET {} {}", key, value));
+                let _ = ws.send_with_str(&to_resp(&["SET", key, value]));
             }
         }
 
@@ -89,24 +97,21 @@ impl RecachedCache {
         }
     }
 
-    /// Get a value locally (zero latency)
+    /// Get a value from the local store (zero latency).
     pub fn get(&self, key: &str) -> Option<String> {
-        let cmd = Command::Get(key.to_string());
-        let resp = self.store.execute(cmd);
-        match resp {
-            Value::BulkString(Some(data)) => Some(String::from_utf8_lossy(&data).to_string()),
+        match self.store.execute(Command::Get(key.to_string())) {
+            Value::BulkString(Some(data)) => Some(String::from_utf8_lossy(&data).into_owned()),
             _ => None,
         }
     }
 
-    /// Delete a key and sync to server
+    /// Delete a key locally and sync to the server.
     pub fn del(&self, key: &str) -> i32 {
-        let cmd = Command::Del(vec![key.to_string()]);
-        let resp = self.store.execute(cmd);
+        let resp = self.store.execute(Command::Del(vec![key.to_string()]));
 
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {
-                let _ = ws.send_with_str(&format!("DEL {}", key));
+                let _ = ws.send_with_str(&to_resp(&["DEL", key]));
             }
         }
 

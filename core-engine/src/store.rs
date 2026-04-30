@@ -3,17 +3,30 @@ use crate::resp::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct KeyValueStore {
-    // For the MVP, a simple RwLock HashMap.
-    // In future phases, this can be sharded for extreme multi-core throughput.
     data: Arc<RwLock<HashMap<String, String>>>,
+    max_keys: Option<usize>,
+}
+
+impl Default for KeyValueStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyValueStore {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            max_keys: None,
+        }
+    }
+
+    pub fn with_max_keys(max: usize) -> Self {
+        Self {
+            data: Arc::new(RwLock::new(HashMap::new())),
+            max_keys: Some(max),
         }
     }
 
@@ -28,32 +41,34 @@ impl KeyValueStore {
                 }
             }
             Command::Auth(_) => {
-                // If this hits the store, it means the server interceptor let it through
-                // (e.g., already authenticated or no password required).
+                // Reached only when no password is configured; server interceptor handles the rest.
                 Value::SimpleString("OK".to_string())
             }
             Command::Set(key, val) => {
-                let mut lock = self.data.write().unwrap();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(max) = self.max_keys
+                    && lock.len() >= max
+                    && !lock.contains_key(&key)
+                {
+                    return Value::Error("ERR max keys limit reached".to_string());
+                }
                 lock.insert(key, val);
                 Value::SimpleString("OK".to_string())
             }
             Command::Get(key) => {
-                let lock = self.data.read().unwrap();
-                if let Some(val) = lock.get(&key) {
-                    Value::BulkString(Some(val.clone().into_bytes()))
-                } else {
-                    Value::BulkString(None) // Null bulk string indicates key not found
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    Some(val) => Value::BulkString(Some(val.clone().into_bytes())),
+                    None => Value::BulkString(None),
                 }
             }
             Command::Del(keys) => {
-                let mut lock = self.data.write().unwrap();
-                let mut count = 0;
-                for key in keys {
-                    if lock.remove(&key).is_some() {
-                        count += 1;
-                    }
-                }
-                Value::Integer(count)
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let count = keys
+                    .into_iter()
+                    .filter(|k| lock.remove(k).is_some())
+                    .count();
+                Value::Integer(count as i64)
             }
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
         }
