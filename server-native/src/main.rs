@@ -81,8 +81,10 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         }
         Command::MSet(pairs) => {
             let mut parts: Vec<&str> = vec!["MSET"];
-            let flat: Vec<String> =
-                pairs.iter().flat_map(|(k, v)| [k.clone(), v.clone()]).collect();
+            let flat: Vec<String> = pairs
+                .iter()
+                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .collect();
             let flat_refs: Vec<&str> = flat.iter().map(|s| s.as_str()).collect();
             parts.extend_from_slice(&flat_refs);
             Some(resp_command(&parts))
@@ -151,7 +153,233 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             Value::Error(_) => None,
             _ => Some(resp_command(&["RENAME", src, dst])),
         },
+
+        // ── Hash ─────────────────────────────────────────────────────────────
+        Command::HSet(k, pairs) => {
+            let mut parts: Vec<String> = vec!["HSET".into(), k.clone()];
+            for (f, v) in pairs {
+                parts.push(f.clone());
+                parts.push(v.clone());
+            }
+            let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            Some(resp_command(&refs))
+        }
+        Command::HDel(k, fields) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&str> = vec!["HDEL", k];
+                let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+                parts.extend_from_slice(&field_refs);
+                Some(resp_command(&parts))
+            }
+            _ => None,
+        },
+        Command::HIncrBy(k, f, _) => match response {
+            Value::Integer(n) => {
+                let s = n.to_string();
+                Some(resp_command(&["HSET", k, f, &s]))
+            }
+            _ => None,
+        },
+        Command::HIncrByFloat(k, f, _) => match response {
+            Value::BulkString(Some(data)) => {
+                let s = String::from_utf8_lossy(data);
+                Some(resp_command(&["HSET", k, f, &s]))
+            }
+            _ => None,
+        },
+        Command::HSetNx(k, f, v) => match response {
+            Value::Integer(1) => Some(resp_command(&["HSET", k, f, v])),
+            _ => None,
+        },
+
+        // ── List ─────────────────────────────────────────────────────────────
+        Command::LPush(k, vals) | Command::RPush(k, vals) => {
+            let cmd_name = if matches!(cmd, Command::LPush(_, _)) {
+                "LPUSH"
+            } else {
+                "RPUSH"
+            };
+            let mut parts: Vec<&str> = vec![cmd_name, k];
+            let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+            parts.extend_from_slice(&val_refs);
+            Some(resp_command(&parts))
+        }
+        Command::LPushX(k, vals) | Command::RPushX(k, vals) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let cmd_name = if matches!(cmd, Command::LPushX(_, _)) {
+                    "LPUSH"
+                } else {
+                    "RPUSH"
+                };
+                let mut parts: Vec<&str> = vec![cmd_name, k];
+                let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+                parts.extend_from_slice(&val_refs);
+                Some(resp_command(&parts))
+            }
+            _ => None,
+        },
+        Command::LPop(k, count) => match response {
+            Value::BulkString(None) => None,
+            Value::Array(Some(items)) if items.is_empty() => None,
+            _ => {
+                let n = count.map(|c| c.to_string());
+                match &n {
+                    Some(ns) => Some(resp_command(&["LPOP", k, ns])),
+                    None => Some(resp_command(&["LPOP", k])),
+                }
+            }
+        },
+        Command::RPop(k, count) => match response {
+            Value::BulkString(None) => None,
+            Value::Array(Some(items)) if items.is_empty() => None,
+            _ => {
+                let n = count.map(|c| c.to_string());
+                match &n {
+                    Some(ns) => Some(resp_command(&["RPOP", k, ns])),
+                    None => Some(resp_command(&["RPOP", k])),
+                }
+            }
+        },
+        Command::LSet(k, idx, v) => match response {
+            Value::SimpleString(_) => {
+                let idx_s = idx.to_string();
+                Some(resp_command(&["LSET", k, &idx_s, v]))
+            }
+            _ => None,
+        },
+        Command::LRem(k, count, elem) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let count_s = count.to_string();
+                Some(resp_command(&["LREM", k, &count_s, elem]))
+            }
+            _ => None,
+        },
+        Command::LTrim(k, start, stop) => {
+            let start_s = start.to_string();
+            let stop_s = stop.to_string();
+            Some(resp_command(&["LTRIM", k, &start_s, &stop_s]))
+        }
+
+        // ── Set ───────────────────────────────────────────────────────────────
+        Command::SAdd(k, members) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&str> = vec!["SADD", k];
+                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_command(&parts))
+            }
+            _ => None,
+        },
+        Command::SRem(k, members) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&str> = vec!["SREM", k];
+                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_command(&parts))
+            }
+            _ => None,
+        },
+        Command::SPop(k, count) => {
+            // Extract popped members from response and broadcast as SREM
+            let popped: Vec<String> = match response {
+                Value::BulkString(Some(data)) => {
+                    vec![String::from_utf8_lossy(data).into_owned()]
+                }
+                Value::Array(Some(items)) => items
+                    .iter()
+                    .filter_map(|v| {
+                        if let Value::BulkString(Some(d)) = v {
+                            Some(String::from_utf8_lossy(d).into_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => vec![],
+            };
+            if popped.is_empty() {
+                let _ = count;
+                None
+            } else {
+                let mut parts: Vec<&str> = vec!["SREM", k];
+                let m_refs: Vec<&str> = popped.iter().map(|s| s.as_str()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_command(&parts))
+            }
+        }
+        Command::SMove(src, dst, member) => match response {
+            Value::Integer(1) => Some(resp_command(&["SMOVE", src, dst, member])),
+            _ => None,
+        },
+        Command::SInterStore(dst, keys) => {
+            let mut parts: Vec<&str> = vec!["SINTERSTORE", dst];
+            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            parts.extend_from_slice(&k_refs);
+            Some(resp_command(&parts))
+        }
+        Command::SUnionStore(dst, keys) => {
+            let mut parts: Vec<&str> = vec!["SUNIONSTORE", dst];
+            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            parts.extend_from_slice(&k_refs);
+            Some(resp_command(&parts))
+        }
+        Command::SDiffStore(dst, keys) => {
+            let mut parts: Vec<&str> = vec!["SDIFFSTORE", dst];
+            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            parts.extend_from_slice(&k_refs);
+            Some(resp_command(&parts))
+        }
+
+        // ── Sorted Set ────────────────────────────────────────────────────────
+        Command::ZAdd(k, opts, pairs) => {
+            use core_engine::cmd::ZAddCondition;
+            let mut parts: Vec<String> = vec!["ZADD".into(), k.clone()];
+            if let Some(cond) = &opts.condition {
+                parts.push(match cond {
+                    ZAddCondition::Nx => "NX".into(),
+                    ZAddCondition::Xx => "XX".into(),
+                });
+            }
+            if opts.ch {
+                parts.push("CH".into());
+            }
+            if opts.incr {
+                parts.push("INCR".into());
+            }
+            for (score, member) in pairs {
+                parts.push(format_f64_score(*score));
+                parts.push(member.clone());
+            }
+            let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            Some(resp_command(&refs))
+        }
+        Command::ZRem(k, members) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&str> = vec!["ZREM", k];
+                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_command(&parts))
+            }
+            _ => None,
+        },
+        Command::ZIncrBy(k, delta, member) => {
+            let delta_s = format_f64_score(*delta);
+            Some(resp_command(&["ZINCRBY", k, &delta_s, member]))
+        }
+
         _ => None,
+    }
+}
+
+fn format_f64_score(s: f64) -> String {
+    if s == f64::INFINITY {
+        "inf".into()
+    } else if s == f64::NEG_INFINITY {
+        "-inf".into()
+    } else if s.fract() == 0.0 && s.abs() < 1e15 {
+        format!("{}", s as i64)
+    } else {
+        format!("{}", s)
     }
 }
 
@@ -207,23 +435,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── IP allowlist ──────────────────────────────────────────────────────
-    let allowed_ips: Option<Arc<Vec<IpAddr>>> =
-        std::env::var("RECACHED_ALLOW_IPS").ok().map(|s| {
-            let ips: Vec<IpAddr> = s
-                .split(',')
-                .filter_map(|raw| {
-                    let trimmed = raw.trim();
-                    match IpAddr::from_str(trimmed) {
-                        Ok(ip) => Some(ip),
-                        Err(_) => {
-                            warn!("RECACHED_ALLOW_IPS: ignoring invalid entry '{}'", trimmed);
-                            None
-                        }
+    let allowed_ips: Option<Arc<Vec<IpAddr>>> = std::env::var("RECACHED_ALLOW_IPS").ok().map(|s| {
+        let ips: Vec<IpAddr> = s
+            .split(',')
+            .filter_map(|raw| {
+                let trimmed = raw.trim();
+                match IpAddr::from_str(trimmed) {
+                    Ok(ip) => Some(ip),
+                    Err(_) => {
+                        warn!("RECACHED_ALLOW_IPS: ignoring invalid entry '{}'", trimmed);
+                        None
                     }
-                })
-                .collect();
-            Arc::new(ips)
-        });
+                }
+            })
+            .collect();
+        Arc::new(ips)
+    });
 
     if let Some(ips) = &allowed_ips {
         info!("IP allowlist ENABLED: {:?}", ips);
@@ -248,9 +475,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let store_sweep = Arc::clone(&store);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
-                EVICTION_INTERVAL_SECS,
-            ));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(EVICTION_INTERVAL_SECS));
             loop {
                 interval.tick().await;
                 store_sweep.sweep_expired();
@@ -401,11 +627,10 @@ async fn handle_tcp(
 
                             let response = store.execute(cmd.clone());
 
-                            if let Some(msg) = broadcast_for(&cmd, &response) {
-                                if let Err(e) = tx.send((0, msg)) {
+                            if let Some(msg) = broadcast_for(&cmd, &response)
+                                && let Err(e) = tx.send((0, msg)) {
                                     debug!("TCP broadcast had no WS receivers: {}", e);
                                 }
-                            }
 
                             if let Err(e) = socket.write_all(&response.serialize()).await {
                                 warn!("TCP write error: {}", e);
@@ -520,11 +745,10 @@ async fn handle_ws(
 
                         let response = store.execute(cmd.clone());
 
-                        if let Some(b_msg) = broadcast_for(&cmd, &response) {
-                            if let Err(e) = tx.send((conn_id, b_msg)) {
+                        if let Some(b_msg) = broadcast_for(&cmd, &response)
+                            && let Err(e) = tx.send((conn_id, b_msg)) {
                                 debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
                             }
-                        }
 
                         if let Err(e) = ws_sender.send(Message::Text(
                             String::from_utf8_lossy(&response.serialize()).into_owned().into(),

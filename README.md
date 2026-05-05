@@ -17,7 +17,7 @@ On the backend it speaks RESP, so any Redis client works against it today. In th
 
 > [!WARNING]
 > **Status: Active Development**
-> The core protocol and sync architecture are solid, but Recached only implements a small subset of Redis commands today (`GET`, `SET`, `DEL`, `PING`, `AUTH`). It is not yet a Redis replacement for production workloads. Use it for local-first web apps, prototypes, and edge caching experiments.
+> The core protocol, TTL engine, and sync architecture are solid. Recached covers the most common Redis use cases — strings, expiry, counters, batch ops, key scans. It is not yet a full Redis replacement (no collections, no pub/sub, no persistence). Best for local-first web apps, session caches, rate limiters, and edge caching experiments.
 
 ---
 
@@ -113,7 +113,7 @@ Three crates with hard dependency boundaries:
 
 ## What works today
 
-- `PING`, `SET`, `GET`, `DEL`, `AUTH`
+**Protocol & server**
 - RESP protocol — full parser/serializer, handles fragmentation, depth-limited (no stack-overflow DoS)
 - TCP (port 6379) compatible with any Redis client
 - WebSocket sync (port 6380) between server and browser WASM instances
@@ -122,7 +122,15 @@ Three crates with hard dependency boundaries:
 - `RECACHED_ALLOW_IPS` with validated IP parsing
 - `RECACHED_MAX_KEYS` memory cap
 - Connection semaphore (max 1024 concurrent)
+- Background active eviction (1s sweep) + lazy eviction on every read
 - Structured `tracing` logs
+
+**Commands**
+- Core: `PING`, `AUTH`
+- Strings: `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `GET`, `GETSET`, `MGET`, `MSET`, `SETNX`, `SETEX`, `PSETEX`, `APPEND`, `STRLEN`
+- Counters: `INCR`, `DECR`, `INCRBY`, `DECRBY`
+- Expiry: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
+- Keys: `DEL`, `UNLINK`, `EXISTS`, `TYPE`, `RENAME`, `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`
 
 ---
 
@@ -130,26 +138,19 @@ Three crates with hard dependency boundaries:
 
 ### Redis command parity
 
-The goal is full behavioral compatibility so Recached can be a genuine drop-in for Redis. This is unglamorous but necessary.
+The goal is enough behavioral compatibility to cover the top real-world use cases, not a full Redis clone. Full parity (250+ commands, Lua scripting, RDB/AOF, replication) doesn't fit the browser-sync model and won't be pursued.
 
-**Phase 2 — Strings & TTL**
-- String ops: `APPEND`, `STRLEN`, `INCR`/`DECR`, `MGET`/`MSET`, `GETSET`, `SETNX`/`SETEX`, `SET EX/PX/NX/XX`
-- Expiry: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, background lazy eviction
-- Key ops: `EXISTS`, `TYPE`, `RENAME`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`, `UNLINK`
+**Phase 3 — Collections** ← next
+- Hash (`HSET`, `HGET`, `HGETALL`, `HDEL`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`) — best ROI; structured objects, session blobs
+- List (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`) — queues, message history
+- Set (`SADD`, `SMEMBERS`, `SREM`, `SCARD`, `SISMEMBER`, `SINTER`, `SUNION`, `SDIFF`) — dedup, tagging
+- Sorted Set (`ZADD`, `ZRANGE`, `ZSCORE`, `ZRANK`, `ZREM`, `ZCARD`) — deferred; high complexity, narrow use cases
 
-**Phase 3 — Collections**
-- Hash: `HSET`, `HGET`, `HGETALL`, `HDEL`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`
-- List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `BLPOP`, `BRPOP`
-- Set: `SADD`, `SMEMBERS`, `SREM`, `SCARD`, `SISMEMBER`, `SINTER`, `SUNION`, `SDIFF`
-- Sorted Set: `ZADD`, `ZRANGE`, `ZSCORE`, `ZRANK`, `ZREM`, `ZCARD`, `ZINCRBY`
+**Phase 4 — Selected advanced commands**
+- Transactions: `MULTI`, `EXEC`, `DISCARD` — prevent counter races, atomic batch writes
+- Pub/Sub: `SUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE` — natural fit for the WebSocket broadcast layer
 
-**Phase 4 — Advanced Redis**
-- Pub/Sub: `SUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE`
-- Transactions: `MULTI`, `EXEC`, `DISCARD`, `WATCH`
-- Persistence: RDB snapshots (`BGSAVE`), AOF with configurable `fsync`
-- Replication: `REPLICAOF`, read-replica propagation
-- Scripting: `EVAL`, `EVALSHA`
-- Server: `INFO`, `CONFIG GET/SET`, `COMMAND`, `SLOWLOG`
+Intentionally out of scope: RDB/AOF persistence (a browser-synced in-memory cache doesn't need disk durability), `REPLICAOF` (the native→browser WebSocket is already the sync story), Lua scripting (`EVAL` doesn't run in WASM), server introspection (`INFO`, `SLOWLOG`, `COMMAND`).
 
 ---
 
@@ -183,9 +184,9 @@ These are things Redis either can't do or requires paid modules/plugins for.
 
 The most useful contributions right now:
 
-1. **Phase 2 commands** — `INCR`, `EXPIRE`, `TTL` are the most-requested missing pieces
+1. **Phase 3 collections** — Hash commands (`HSET`/`HGET`/`HGETALL`) are the highest-impact next piece
 2. **Benchmarks** — `redis-benchmark` against Redis 7 on multi-core hardware (results welcome either way)
 3. **Client examples** — React, Vue, or SvelteKit demos using `recached-edge`
-4. **Bug reports** — edge cases in the RESP parser or WebSocket sync
+4. **Bug reports** — edge cases in the RESP parser, TTL eviction, or WebSocket sync
 
 Open a PR or file an issue.

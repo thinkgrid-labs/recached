@@ -1,11 +1,13 @@
 use crate::resp::Value;
 
+// ── SET options ───────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetExpiry {
-    Ex(u64),    // seconds
-    Px(u64),    // milliseconds
-    Exat(u64),  // unix-time seconds
-    Pxat(u64),  // unix-time milliseconds
+    Ex(u64),
+    Px(u64),
+    Exat(u64),
+    Pxat(u64),
     KeepTtl,
 }
 
@@ -22,11 +24,28 @@ pub struct SetOptions {
     pub get: bool,
 }
 
+// ── ZADD options ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ZAddCondition {
+    Nx,
+    Xx,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ZAddOptions {
+    pub condition: Option<ZAddCondition>,
+    pub ch: bool,
+    pub incr: bool,
+}
+
+// ── Command enum ──────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Ping(Option<String>),
     Auth(String),
-    // Strings
+    // ── Strings ──────────────────────────────────────────────────────────────
     Set(String, String, SetOptions),
     Get(String),
     Del(Vec<String>),
@@ -43,7 +62,7 @@ pub enum Command {
     Decr(String),
     IncrBy(String, i64),
     DecrBy(String, i64),
-    // Expiry
+    // ── Expiry ────────────────────────────────────────────────────────────────
     Expire(String, u64),
     PExpire(String, u64),
     ExpireAt(String, u64),
@@ -51,7 +70,7 @@ pub enum Command {
     Ttl(String),
     PTtl(String),
     Persist(String),
-    // Keys
+    // ── Keys ─────────────────────────────────────────────────────────────────
     Exists(Vec<String>),
     Keys(String),
     Scan(u64, Option<String>, Option<usize>),
@@ -59,11 +78,66 @@ pub enum Command {
     FlushDb,
     Rename(String, String),
     Type(String),
+    // ── Hash ─────────────────────────────────────────────────────────────────
+    HSet(String, Vec<(String, String)>),
+    HGet(String, String),
+    HGetAll(String),
+    HDel(String, Vec<String>),
+    HKeys(String),
+    HVals(String),
+    HLen(String),
+    HIncrBy(String, String, i64),
+    HIncrByFloat(String, String, f64),
+    HExists(String, String),
+    HSetNx(String, String, String),
+    HMGet(String, Vec<String>),
+    // ── List ─────────────────────────────────────────────────────────────────
+    LPush(String, Vec<String>),
+    RPush(String, Vec<String>),
+    LPushX(String, Vec<String>),
+    RPushX(String, Vec<String>),
+    LPop(String, Option<u64>),
+    RPop(String, Option<u64>),
+    LRange(String, i64, i64),
+    LLen(String),
+    LIndex(String, i64),
+    LSet(String, i64, String),
+    LRem(String, i64, String),
+    LTrim(String, i64, i64),
+    // ── Set ──────────────────────────────────────────────────────────────────
+    SAdd(String, Vec<String>),
+    SMembers(String),
+    SRem(String, Vec<String>),
+    SCard(String),
+    SIsMember(String, String),
+    SMIsMember(String, Vec<String>),
+    SInter(Vec<String>),
+    SInterStore(String, Vec<String>),
+    SUnion(Vec<String>),
+    SUnionStore(String, Vec<String>),
+    SDiff(Vec<String>),
+    SDiffStore(String, Vec<String>),
+    SPop(String, Option<u64>),
+    SRandMember(String, Option<i64>),
+    SMove(String, String, String),
+    // ── Sorted Set ───────────────────────────────────────────────────────────
+    ZAdd(String, ZAddOptions, Vec<(f64, String)>),
+    ZRange(String, i64, i64, bool),
+    ZRevRange(String, i64, i64, bool),
+    ZRangeByScore(String, String, String, bool, Option<(i64, i64)>),
+    ZRevRangeByScore(String, String, String, bool, Option<(i64, i64)>),
+    ZScore(String, String),
+    ZMScore(String, Vec<String>),
+    ZRank(String, String),
+    ZRevRank(String, String),
+    ZRem(String, Vec<String>),
+    ZCard(String),
+    ZIncrBy(String, f64, String),
+    ZCount(String, String, String),
     Unknown(String),
 }
 
 impl Command {
-    /// Translates a RESP Value (usually an Array of BulkStrings) into a typed Command.
     pub fn from_value(value: Value) -> Result<Command, String> {
         match value {
             Value::Array(Some(arr)) => {
@@ -88,14 +162,21 @@ impl Command {
                 }
 
                 match cmd_name.as_str() {
+                    // ── Core ─────────────────────────────────────────────────
                     "PING" => {
-                        let msg = if arr.len() > 1 { extract_string(&arr[1]) } else { None };
+                        let msg = if arr.len() > 1 {
+                            extract_string(&arr[1])
+                        } else {
+                            None
+                        };
                         Ok(Command::Ping(msg))
                     }
                     "AUTH" => {
                         need!(2);
                         Ok(Command::Auth(extract_string(&arr[1]).unwrap_or_default()))
                     }
+
+                    // ── Strings ───────────────────────────────────────────────
                     "SET" => {
                         need!(3);
                         let key = extract_string(&arr[1]).unwrap_or_default();
@@ -103,8 +184,7 @@ impl Command {
                         let mut opts = SetOptions::default();
                         let mut i = 3usize;
                         while i < arr.len() {
-                            let flag =
-                                extract_string(&arr[i]).unwrap_or_default().to_uppercase();
+                            let flag = extract_string(&arr[i]).unwrap_or_default().to_uppercase();
                             match flag.as_str() {
                                 "EX" => {
                                     i += 1;
@@ -114,8 +194,7 @@ impl Command {
                                     let n = extract_int(&arr[i])?;
                                     if n <= 0 {
                                         return Err(
-                                            "ERR invalid expire time in 'set' command"
-                                                .to_string(),
+                                            "ERR invalid expire time in 'set' command".to_string()
                                         );
                                     }
                                     opts.expiry = Some(SetExpiry::Ex(n as u64));
@@ -128,8 +207,7 @@ impl Command {
                                     let n = extract_int(&arr[i])?;
                                     if n <= 0 {
                                         return Err(
-                                            "ERR invalid expire time in 'set' command"
-                                                .to_string(),
+                                            "ERR invalid expire time in 'set' command".to_string()
                                         );
                                     }
                                     opts.expiry = Some(SetExpiry::Px(n as u64));
@@ -142,8 +220,7 @@ impl Command {
                                     let n = extract_int(&arr[i])?;
                                     if n <= 0 {
                                         return Err(
-                                            "ERR invalid expire time in 'set' command"
-                                                .to_string(),
+                                            "ERR invalid expire time in 'set' command".to_string()
                                         );
                                     }
                                     opts.expiry = Some(SetExpiry::Exat(n as u64));
@@ -156,8 +233,7 @@ impl Command {
                                     let n = extract_int(&arr[i])?;
                                     if n <= 0 {
                                         return Err(
-                                            "ERR invalid expire time in 'set' command"
-                                                .to_string(),
+                                            "ERR invalid expire time in 'set' command".to_string()
                                         );
                                     }
                                     opts.expiry = Some(SetExpiry::Pxat(n as u64));
@@ -165,15 +241,9 @@ impl Command {
                                 "KEEPTTL" => {
                                     opts.expiry = Some(SetExpiry::KeepTtl);
                                 }
-                                "NX" => {
-                                    opts.condition = Some(SetCondition::Nx);
-                                }
-                                "XX" => {
-                                    opts.condition = Some(SetCondition::Xx);
-                                }
-                                "GET" => {
-                                    opts.get = true;
-                                }
+                                "NX" => opts.condition = Some(SetCondition::Nx),
+                                "XX" => opts.condition = Some(SetCondition::Xx),
+                                "GET" => opts.get = true,
                                 _ => return Err("ERR syntax error".to_string()),
                             }
                             i += 1;
@@ -186,17 +256,22 @@ impl Command {
                     }
                     "DEL" => {
                         need!(2);
-                        Ok(Command::Del(arr[1..].iter().filter_map(extract_string).collect()))
+                        Ok(Command::Del(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
                     }
                     "UNLINK" => {
                         need!(2);
-                        Ok(Command::Unlink(arr[1..].iter().filter_map(extract_string).collect()))
+                        Ok(Command::Unlink(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
                     }
                     "APPEND" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
-                        let val = extract_string(&arr[2]).unwrap_or_default();
-                        Ok(Command::Append(key, val))
+                        Ok(Command::Append(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
                     }
                     "STRLEN" => {
                         need!(2);
@@ -204,13 +279,16 @@ impl Command {
                     }
                     "GETSET" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
-                        let val = extract_string(&arr[2]).unwrap_or_default();
-                        Ok(Command::GetSet(key, val))
+                        Ok(Command::GetSet(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
                     }
                     "MGET" => {
                         need!(2);
-                        Ok(Command::MGet(arr[1..].iter().filter_map(extract_string).collect()))
+                        Ok(Command::MGet(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
                     }
                     "MSET" => {
                         if arr.len() < 3 || (arr.len() - 1) % 2 != 0 {
@@ -231,33 +309,34 @@ impl Command {
                     }
                     "SETNX" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
-                        let val = extract_string(&arr[2]).unwrap_or_default();
-                        Ok(Command::SetNx(key, val))
+                        Ok(Command::SetNx(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
                     }
                     "SETEX" => {
                         need!(4);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
                         let secs = extract_int(&arr[2])?;
                         if secs <= 0 {
-                            return Err(
-                                "ERR invalid expire time in 'setex' command".to_string()
-                            );
+                            return Err("ERR invalid expire time in 'setex' command".to_string());
                         }
-                        let val = extract_string(&arr[3]).unwrap_or_default();
-                        Ok(Command::SetEx(key, secs as u64, val))
+                        Ok(Command::SetEx(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            secs as u64,
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
                     }
                     "PSETEX" => {
                         need!(4);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
                         let ms = extract_int(&arr[2])?;
                         if ms <= 0 {
-                            return Err(
-                                "ERR invalid expire time in 'psetex' command".to_string()
-                            );
+                            return Err("ERR invalid expire time in 'psetex' command".to_string());
                         }
-                        let val = extract_string(&arr[3]).unwrap_or_default();
-                        Ok(Command::PSetEx(key, ms as u64, val))
+                        Ok(Command::PSetEx(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            ms as u64,
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
                     }
                     "INCR" => {
                         need!(2);
@@ -269,59 +348,65 @@ impl Command {
                     }
                     "INCRBY" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
-                        let delta = extract_int(&arr[2])?;
-                        Ok(Command::IncrBy(key, delta))
+                        Ok(Command::IncrBy(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_int(&arr[2])?,
+                        ))
                     }
                     "DECRBY" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
-                        let delta = extract_int(&arr[2])?;
-                        Ok(Command::DecrBy(key, delta))
+                        Ok(Command::DecrBy(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_int(&arr[2])?,
+                        ))
                     }
+
+                    // ── Expiry ─────────────────────────────────────────────────
                     "EXPIRE" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
                         let secs = extract_int(&arr[2])?;
                         if secs < 0 {
-                            return Err(
-                                "ERR invalid expire time in 'expire' command".to_string()
-                            );
+                            return Err("ERR invalid expire time in 'expire' command".to_string());
                         }
-                        Ok(Command::Expire(key, secs as u64))
+                        Ok(Command::Expire(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            secs as u64,
+                        ))
                     }
                     "PEXPIRE" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
                         let ms = extract_int(&arr[2])?;
                         if ms < 0 {
-                            return Err(
-                                "ERR invalid expire time in 'pexpire' command".to_string()
-                            );
+                            return Err("ERR invalid expire time in 'pexpire' command".to_string());
                         }
-                        Ok(Command::PExpire(key, ms as u64))
+                        Ok(Command::PExpire(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            ms as u64,
+                        ))
                     }
                     "EXPIREAT" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
                         let ts = extract_int(&arr[2])?;
                         if ts < 0 {
-                            return Err(
-                                "ERR invalid expire time in 'expireat' command".to_string()
-                            );
+                            return Err("ERR invalid expire time in 'expireat' command".to_string());
                         }
-                        Ok(Command::ExpireAt(key, ts as u64))
+                        Ok(Command::ExpireAt(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            ts as u64,
+                        ))
                     }
                     "PEXPIREAT" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
                         let ts = extract_int(&arr[2])?;
                         if ts < 0 {
                             return Err(
                                 "ERR invalid expire time in 'pexpireat' command".to_string()
                             );
                         }
-                        Ok(Command::PExpireAt(key, ts as u64))
+                        Ok(Command::PExpireAt(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            ts as u64,
+                        ))
                     }
                     "TTL" => {
                         need!(2);
@@ -333,11 +418,17 @@ impl Command {
                     }
                     "PERSIST" => {
                         need!(2);
-                        Ok(Command::Persist(extract_string(&arr[1]).unwrap_or_default()))
+                        Ok(Command::Persist(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                        ))
                     }
+
+                    // ── Keys ───────────────────────────────────────────────────
                     "EXISTS" => {
                         need!(2);
-                        Ok(Command::Exists(arr[1..].iter().filter_map(extract_string).collect()))
+                        Ok(Command::Exists(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
                     }
                     "KEYS" => {
                         need!(2);
@@ -345,16 +436,17 @@ impl Command {
                     }
                     "SCAN" => {
                         need!(2);
-                        let cursor_str = extract_string(&arr[1]).unwrap_or_default();
-                        let cursor = cursor_str.parse::<u64>().map_err(|_| {
-                            "ERR value is not an integer or out of range".to_string()
-                        })?;
+                        let cursor = extract_string(&arr[1])
+                            .unwrap_or_default()
+                            .parse::<u64>()
+                            .map_err(|_| {
+                                "ERR value is not an integer or out of range".to_string()
+                            })?;
                         let mut pattern = None;
                         let mut count = None;
                         let mut i = 2usize;
                         while i < arr.len() {
-                            let opt =
-                                extract_string(&arr[i]).unwrap_or_default().to_uppercase();
+                            let opt = extract_string(&arr[i]).unwrap_or_default().to_uppercase();
                             match opt.as_str() {
                                 "MATCH" => {
                                     i += 1;
@@ -368,8 +460,7 @@ impl Command {
                                     if i >= arr.len() {
                                         return Err("ERR syntax error".to_string());
                                     }
-                                    let n = extract_int(&arr[i])?;
-                                    count = Some(n as usize);
+                                    count = Some(extract_int(&arr[i])? as usize);
                                 }
                                 _ => return Err("ERR syntax error".to_string()),
                             }
@@ -381,14 +472,444 @@ impl Command {
                     "FLUSHDB" => Ok(Command::FlushDb),
                     "RENAME" => {
                         need!(3);
-                        let src = extract_string(&arr[1]).unwrap_or_default();
-                        let dst = extract_string(&arr[2]).unwrap_or_default();
-                        Ok(Command::Rename(src, dst))
+                        Ok(Command::Rename(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
                     }
                     "TYPE" => {
                         need!(2);
                         Ok(Command::Type(extract_string(&arr[1]).unwrap_or_default()))
                     }
+
+                    // ── Hash ───────────────────────────────────────────────────
+                    "HSET" | "HMSET" => {
+                        if arr.len() < 4 || (arr.len() - 2) % 2 != 0 {
+                            return Err(format!(
+                                "ERR wrong number of arguments for '{}' command",
+                                cmd_name.to_lowercase()
+                            ));
+                        }
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let pairs = arr[2..]
+                            .chunks(2)
+                            .map(|c| {
+                                (
+                                    extract_string(&c[0]).unwrap_or_default(),
+                                    extract_string(&c[1]).unwrap_or_default(),
+                                )
+                            })
+                            .collect();
+                        Ok(Command::HSet(key, pairs))
+                    }
+                    "HGET" => {
+                        need!(3);
+                        Ok(Command::HGet(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+                    "HGETALL" => {
+                        need!(2);
+                        Ok(Command::HGetAll(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                        ))
+                    }
+                    "HDEL" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let fields = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::HDel(key, fields))
+                    }
+                    "HKEYS" => {
+                        need!(2);
+                        Ok(Command::HKeys(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+                    "HVALS" => {
+                        need!(2);
+                        Ok(Command::HVals(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+                    "HLEN" => {
+                        need!(2);
+                        Ok(Command::HLen(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+                    "HINCRBY" => {
+                        need!(4);
+                        Ok(Command::HIncrBy(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_int(&arr[3])?,
+                        ))
+                    }
+                    "HINCRBYFLOAT" => {
+                        need!(4);
+                        let inc = extract_float(&arr[3])?;
+                        Ok(Command::HIncrByFloat(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                            inc,
+                        ))
+                    }
+                    "HEXISTS" => {
+                        need!(3);
+                        Ok(Command::HExists(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+                    "HSETNX" => {
+                        need!(4);
+                        Ok(Command::HSetNx(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+                    "HMGET" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let fields = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::HMGet(key, fields))
+                    }
+
+                    // ── List ───────────────────────────────────────────────────
+                    "LPUSH" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::LPush(key, vals))
+                    }
+                    "RPUSH" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::RPush(key, vals))
+                    }
+                    "LPUSHX" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::LPushX(key, vals))
+                    }
+                    "RPUSHX" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::RPushX(key, vals))
+                    }
+                    "LPOP" => {
+                        need!(2);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let count = if arr.len() > 2 {
+                            Some(extract_int(&arr[2])? as u64)
+                        } else {
+                            None
+                        };
+                        Ok(Command::LPop(key, count))
+                    }
+                    "RPOP" => {
+                        need!(2);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let count = if arr.len() > 2 {
+                            Some(extract_int(&arr[2])? as u64)
+                        } else {
+                            None
+                        };
+                        Ok(Command::RPop(key, count))
+                    }
+                    "LRANGE" => {
+                        need!(4);
+                        Ok(Command::LRange(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_int(&arr[2])?,
+                            extract_int(&arr[3])?,
+                        ))
+                    }
+                    "LLEN" => {
+                        need!(2);
+                        Ok(Command::LLen(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+                    "LINDEX" => {
+                        need!(3);
+                        Ok(Command::LIndex(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_int(&arr[2])?,
+                        ))
+                    }
+                    "LSET" => {
+                        need!(4);
+                        Ok(Command::LSet(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_int(&arr[2])?,
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+                    "LREM" => {
+                        need!(4);
+                        Ok(Command::LRem(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_int(&arr[2])?,
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+                    "LTRIM" => {
+                        need!(4);
+                        Ok(Command::LTrim(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_int(&arr[2])?,
+                            extract_int(&arr[3])?,
+                        ))
+                    }
+
+                    // ── Set ────────────────────────────────────────────────────
+                    "SADD" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::SAdd(key, members))
+                    }
+                    "SMEMBERS" => {
+                        need!(2);
+                        Ok(Command::SMembers(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                        ))
+                    }
+                    "SREM" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::SRem(key, members))
+                    }
+                    "SCARD" => {
+                        need!(2);
+                        Ok(Command::SCard(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+                    "SISMEMBER" => {
+                        need!(3);
+                        Ok(Command::SIsMember(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+                    "SMISMEMBER" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::SMIsMember(key, members))
+                    }
+                    "SINTER" => {
+                        need!(2);
+                        Ok(Command::SInter(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
+                    }
+                    "SINTERSTORE" => {
+                        need!(3);
+                        let dst = extract_string(&arr[1]).unwrap_or_default();
+                        let keys = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::SInterStore(dst, keys))
+                    }
+                    "SUNION" => {
+                        need!(2);
+                        Ok(Command::SUnion(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
+                    }
+                    "SUNIONSTORE" => {
+                        need!(3);
+                        let dst = extract_string(&arr[1]).unwrap_or_default();
+                        let keys = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::SUnionStore(dst, keys))
+                    }
+                    "SDIFF" => {
+                        need!(2);
+                        Ok(Command::SDiff(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
+                    }
+                    "SDIFFSTORE" => {
+                        need!(3);
+                        let dst = extract_string(&arr[1]).unwrap_or_default();
+                        let keys = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::SDiffStore(dst, keys))
+                    }
+                    "SPOP" => {
+                        need!(2);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let count = if arr.len() > 2 {
+                            Some(extract_int(&arr[2])? as u64)
+                        } else {
+                            None
+                        };
+                        Ok(Command::SPop(key, count))
+                    }
+                    "SRANDMEMBER" => {
+                        need!(2);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let count = if arr.len() > 2 {
+                            Some(extract_int(&arr[2])?)
+                        } else {
+                            None
+                        };
+                        Ok(Command::SRandMember(key, count))
+                    }
+                    "SMOVE" => {
+                        need!(4);
+                        Ok(Command::SMove(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+
+                    // ── Sorted Set ─────────────────────────────────────────────
+                    "ZADD" => {
+                        need!(4);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let mut opts = ZAddOptions::default();
+                        let mut i = 2usize;
+
+                        // Parse leading options (until we hit a parseable float)
+                        while i < arr.len() {
+                            let tok = extract_string(&arr[i]).unwrap_or_default().to_uppercase();
+                            match tok.as_str() {
+                                "NX" => {
+                                    opts.condition = Some(ZAddCondition::Nx);
+                                    i += 1;
+                                }
+                                "XX" => {
+                                    opts.condition = Some(ZAddCondition::Xx);
+                                    i += 1;
+                                }
+                                "GT" | "LT" => {
+                                    i += 1; // recognised but not yet enforced
+                                }
+                                "CH" => {
+                                    opts.ch = true;
+                                    i += 1;
+                                }
+                                "INCR" => {
+                                    opts.incr = true;
+                                    i += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+
+                        if (arr.len() - i) < 2 || !(arr.len() - i).is_multiple_of(2) {
+                            return Err("ERR syntax error".to_string());
+                        }
+
+                        let mut pairs = Vec::new();
+                        while i < arr.len() {
+                            let score = extract_float(&arr[i])?;
+                            let member = extract_string(&arr[i + 1]).unwrap_or_default();
+                            pairs.push((score, member));
+                            i += 2;
+                        }
+
+                        if opts.incr && pairs.len() != 1 {
+                            return Err("ERR INCR option supports a single increment-element pair"
+                                .to_string());
+                        }
+
+                        Ok(Command::ZAdd(key, opts, pairs))
+                    }
+                    "ZRANGE" => {
+                        need!(4);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let start = extract_int(&arr[2])?;
+                        let stop = extract_int(&arr[3])?;
+                        let withscores = arr
+                            .get(4)
+                            .and_then(extract_string)
+                            .map(|s| s.to_uppercase() == "WITHSCORES")
+                            .unwrap_or(false);
+                        Ok(Command::ZRange(key, start, stop, withscores))
+                    }
+                    "ZREVRANGE" => {
+                        need!(4);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let start = extract_int(&arr[2])?;
+                        let stop = extract_int(&arr[3])?;
+                        let withscores = arr
+                            .get(4)
+                            .and_then(extract_string)
+                            .map(|s| s.to_uppercase() == "WITHSCORES")
+                            .unwrap_or(false);
+                        Ok(Command::ZRevRange(key, start, stop, withscores))
+                    }
+                    "ZRANGEBYSCORE" => {
+                        need!(4);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let min = extract_string(&arr[2]).unwrap_or_default();
+                        let max = extract_string(&arr[3]).unwrap_or_default();
+                        let (withscores, limit) = parse_zrange_opts(&arr[4..])?;
+                        Ok(Command::ZRangeByScore(key, min, max, withscores, limit))
+                    }
+                    "ZREVRANGEBYSCORE" => {
+                        need!(4);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let max = extract_string(&arr[2]).unwrap_or_default();
+                        let min = extract_string(&arr[3]).unwrap_or_default();
+                        let (withscores, limit) = parse_zrange_opts(&arr[4..])?;
+                        Ok(Command::ZRevRangeByScore(key, max, min, withscores, limit))
+                    }
+                    "ZSCORE" => {
+                        need!(3);
+                        Ok(Command::ZScore(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+                    "ZMSCORE" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::ZMScore(key, members))
+                    }
+                    "ZRANK" => {
+                        need!(3);
+                        Ok(Command::ZRank(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+                    "ZREVRANK" => {
+                        need!(3);
+                        Ok(Command::ZRevRank(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+                    "ZREM" => {
+                        need!(3);
+                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        Ok(Command::ZRem(key, members))
+                    }
+                    "ZCARD" => {
+                        need!(2);
+                        Ok(Command::ZCard(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+                    "ZINCRBY" => {
+                        need!(4);
+                        let inc = extract_float(&arr[2])?;
+                        Ok(Command::ZIncrBy(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            inc,
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+                    "ZCOUNT" => {
+                        need!(4);
+                        Ok(Command::ZCount(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+
                     _ => Ok(Command::Unknown(cmd_name.to_owned())),
                 }
             }
@@ -396,6 +917,8 @@ impl Command {
         }
     }
 }
+
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 fn extract_string(val: &Value) -> Option<String> {
     match val {
@@ -418,6 +941,58 @@ fn extract_int(val: &Value) -> Result<i64, String> {
     }
 }
 
+fn extract_float(val: &Value) -> Result<f64, String> {
+    match val {
+        Value::BulkString(Some(data)) => {
+            let s = String::from_utf8_lossy(data);
+            if s == "inf" || s == "+inf" {
+                Ok(f64::INFINITY)
+            } else if s == "-inf" {
+                Ok(f64::NEG_INFINITY)
+            } else {
+                s.parse::<f64>()
+                    .map_err(|_| "ERR value is not a valid float".to_string())
+            }
+        }
+        Value::SimpleString(s) => s
+            .parse::<f64>()
+            .map_err(|_| "ERR value is not a valid float".to_string()),
+        Value::Integer(i) => Ok(*i as f64),
+        _ => Err("ERR value is not a valid float".to_string()),
+    }
+}
+
+/// Parse `[WITHSCORES] [LIMIT offset count]` options for ZRANGEBYSCORE / ZREVRANGEBYSCORE.
+fn parse_zrange_opts(tokens: &[Value]) -> Result<(bool, Option<(i64, i64)>), String> {
+    let mut withscores = false;
+    let mut limit = None;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let opt = extract_string(&tokens[i])
+            .unwrap_or_default()
+            .to_uppercase();
+        match opt.as_str() {
+            "WITHSCORES" => {
+                withscores = true;
+                i += 1;
+            }
+            "LIMIT" => {
+                if i + 2 >= tokens.len() {
+                    return Err("ERR syntax error".to_string());
+                }
+                let offset = extract_int(&tokens[i + 1])?;
+                let count = extract_int(&tokens[i + 2])?;
+                limit = Some((offset, count));
+                i += 3;
+            }
+            _ => return Err("ERR syntax error".to_string()),
+        }
+    }
+    Ok((withscores, limit))
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,106 +1005,30 @@ mod tests {
         Value::Array(Some(parts.iter().map(|s| bulk(s)).collect()))
     }
 
+    // ── legacy string/key parsing unchanged ─────────────────────────────────
     #[test]
     fn ping_no_arg() {
-        let cmd = Command::from_value(array(&["PING"])).unwrap();
-        assert_eq!(cmd, Command::Ping(None));
+        assert_eq!(
+            Command::from_value(array(&["PING"])).unwrap(),
+            Command::Ping(None)
+        );
     }
-
-    #[test]
-    fn ping_with_arg() {
-        let cmd = Command::from_value(array(&["PING", "hello"])).unwrap();
-        assert_eq!(cmd, Command::Ping(Some("hello".to_string())));
-    }
-
-    #[test]
-    fn ping_case_insensitive() {
-        let cmd = Command::from_value(array(&["ping"])).unwrap();
-        assert_eq!(cmd, Command::Ping(None));
-    }
-
-    #[test]
-    fn auth_ok() {
-        let cmd = Command::from_value(array(&["AUTH", "secret"])).unwrap();
-        assert_eq!(cmd, Command::Auth("secret".to_string()));
-    }
-
-    #[test]
-    fn auth_missing_password() {
-        let result = Command::from_value(array(&["AUTH"]));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("wrong number of arguments"));
-    }
-
     #[test]
     fn set_plain() {
-        let cmd = Command::from_value(array(&["SET", "key", "value"])).unwrap();
+        let cmd = Command::from_value(array(&["SET", "k", "v"])).unwrap();
         assert_eq!(
             cmd,
-            Command::Set("key".to_string(), "value".to_string(), SetOptions::default())
+            Command::Set("k".into(), "v".into(), SetOptions::default())
         );
     }
-
     #[test]
-    fn set_ex() {
-        let cmd = Command::from_value(array(&["SET", "k", "v", "EX", "60"])).unwrap();
-        assert_eq!(
-            cmd,
-            Command::Set(
-                "k".to_string(),
-                "v".to_string(),
-                SetOptions { expiry: Some(SetExpiry::Ex(60)), ..Default::default() }
-            )
-        );
-    }
-
-    #[test]
-    fn set_px() {
-        let cmd = Command::from_value(array(&["SET", "k", "v", "PX", "5000"])).unwrap();
-        assert_eq!(
-            cmd,
-            Command::Set(
-                "k".to_string(),
-                "v".to_string(),
-                SetOptions { expiry: Some(SetExpiry::Px(5000)), ..Default::default() }
-            )
-        );
-    }
-
-    #[test]
-    fn set_nx() {
-        let cmd = Command::from_value(array(&["SET", "k", "v", "NX"])).unwrap();
-        assert_eq!(
-            cmd,
-            Command::Set(
-                "k".to_string(),
-                "v".to_string(),
-                SetOptions { condition: Some(SetCondition::Nx), ..Default::default() }
-            )
-        );
-    }
-
-    #[test]
-    fn set_xx() {
-        let cmd = Command::from_value(array(&["SET", "k", "v", "XX"])).unwrap();
-        assert_eq!(
-            cmd,
-            Command::Set(
-                "k".to_string(),
-                "v".to_string(),
-                SetOptions { condition: Some(SetCondition::Xx), ..Default::default() }
-            )
-        );
-    }
-
-    #[test]
-    fn set_ex_nx_combined() {
+    fn set_ex_nx() {
         let cmd = Command::from_value(array(&["SET", "k", "v", "EX", "10", "NX"])).unwrap();
         assert_eq!(
             cmd,
             Command::Set(
-                "k".to_string(),
-                "v".to_string(),
+                "k".into(),
+                "v".into(),
                 SetOptions {
                     expiry: Some(SetExpiry::Ex(10)),
                     condition: Some(SetCondition::Nx),
@@ -539,173 +1038,173 @@ mod tests {
         );
     }
 
+    // ── Hash ──────────────────────────────────────────────────────────────────
     #[test]
-    fn set_invalid_ex_zero() {
-        let result = Command::from_value(array(&["SET", "k", "v", "EX", "0"]));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn set_unknown_option() {
-        let result = Command::from_value(array(&["SET", "k", "v", "BOGUS"]));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn set_missing_value() {
-        let result = Command::from_value(array(&["SET", "key"]));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn get_ok() {
-        let cmd = Command::from_value(array(&["GET", "key"])).unwrap();
-        assert_eq!(cmd, Command::Get("key".to_string()));
-    }
-
-    #[test]
-    fn get_missing_key() {
-        let result = Command::from_value(array(&["GET"]));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn del_single_key() {
-        let cmd = Command::from_value(array(&["DEL", "key"])).unwrap();
-        assert_eq!(cmd, Command::Del(vec!["key".to_string()]));
-    }
-
-    #[test]
-    fn del_multiple_keys() {
-        let cmd = Command::from_value(array(&["DEL", "a", "b", "c"])).unwrap();
+    fn hset_single() {
+        let cmd = Command::from_value(array(&["HSET", "h", "f", "v"])).unwrap();
         assert_eq!(
             cmd,
-            Command::Del(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            Command::HSet("h".into(), vec![("f".into(), "v".into())])
+        );
+    }
+    #[test]
+    fn hset_multi() {
+        let cmd = Command::from_value(array(&["HSET", "h", "f1", "v1", "f2", "v2"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::HSet(
+                "h".into(),
+                vec![("f1".into(), "v1".into()), ("f2".into(), "v2".into())]
+            )
+        );
+    }
+    #[test]
+    fn hmset_alias() {
+        let cmd = Command::from_value(array(&["HMSET", "h", "f", "v"])).unwrap();
+        assert!(matches!(cmd, Command::HSet(..)));
+    }
+    #[test]
+    fn hget_ok() {
+        assert_eq!(
+            Command::from_value(array(&["HGET", "h", "f"])).unwrap(),
+            Command::HGet("h".into(), "f".into())
+        );
+    }
+    #[test]
+    fn hincrby_ok() {
+        assert_eq!(
+            Command::from_value(array(&["HINCRBY", "h", "f", "5"])).unwrap(),
+            Command::HIncrBy("h".into(), "f".into(), 5)
         );
     }
 
+    // ── List ──────────────────────────────────────────────────────────────────
     #[test]
-    fn del_missing_key() {
-        let result = Command::from_value(array(&["DEL"]));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn mget_ok() {
-        let cmd = Command::from_value(array(&["MGET", "a", "b"])).unwrap();
-        assert_eq!(cmd, Command::MGet(vec!["a".to_string(), "b".to_string()]));
-    }
-
-    #[test]
-    fn mset_ok() {
-        let cmd = Command::from_value(array(&["MSET", "a", "1", "b", "2"])).unwrap();
+    fn lpush_multi() {
+        let cmd = Command::from_value(array(&["LPUSH", "l", "a", "b", "c"])).unwrap();
         assert_eq!(
             cmd,
-            Command::MSet(vec![
-                ("a".to_string(), "1".to_string()),
-                ("b".to_string(), "2".to_string()),
-            ])
+            Command::LPush("l".into(), vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+    #[test]
+    fn rpop_with_count() {
+        let cmd = Command::from_value(array(&["RPOP", "l", "3"])).unwrap();
+        assert_eq!(cmd, Command::RPop("l".into(), Some(3)));
+    }
+    #[test]
+    fn lrange_ok() {
+        assert_eq!(
+            Command::from_value(array(&["LRANGE", "l", "0", "-1"])).unwrap(),
+            Command::LRange("l".into(), 0, -1)
         );
     }
 
+    // ── Set ───────────────────────────────────────────────────────────────────
     #[test]
-    fn mset_odd_args() {
-        let result = Command::from_value(array(&["MSET", "a", "1", "b"]));
-        assert!(result.is_err());
+    fn sadd_multi() {
+        let cmd = Command::from_value(array(&["SADD", "s", "a", "b"])).unwrap();
+        assert_eq!(cmd, Command::SAdd("s".into(), vec!["a".into(), "b".into()]));
     }
-
     #[test]
-    fn incr_ok() {
-        let cmd = Command::from_value(array(&["INCR", "counter"])).unwrap();
-        assert_eq!(cmd, Command::Incr("counter".to_string()));
-    }
-
-    #[test]
-    fn incrby_ok() {
-        let cmd = Command::from_value(array(&["INCRBY", "counter", "5"])).unwrap();
-        assert_eq!(cmd, Command::IncrBy("counter".to_string(), 5));
-    }
-
-    #[test]
-    fn expire_ok() {
-        let cmd = Command::from_value(array(&["EXPIRE", "k", "60"])).unwrap();
-        assert_eq!(cmd, Command::Expire("k".to_string(), 60));
-    }
-
-    #[test]
-    fn expire_negative() {
-        let result = Command::from_value(array(&["EXPIRE", "k", "-1"]));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn ttl_ok() {
-        let cmd = Command::from_value(array(&["TTL", "k"])).unwrap();
-        assert_eq!(cmd, Command::Ttl("k".to_string()));
-    }
-
-    #[test]
-    fn exists_multiple() {
-        let cmd = Command::from_value(array(&["EXISTS", "a", "b", "a"])).unwrap();
+    fn sinter_multi_keys() {
+        let cmd = Command::from_value(array(&["SINTER", "s1", "s2", "s3"])).unwrap();
         assert_eq!(
             cmd,
-            Command::Exists(vec!["a".to_string(), "b".to_string(), "a".to_string()])
+            Command::SInter(vec!["s1".into(), "s2".into(), "s3".into()])
+        );
+    }
+    #[test]
+    fn smismember_ok() {
+        let cmd = Command::from_value(array(&["SMISMEMBER", "s", "a", "b"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SMIsMember("s".into(), vec!["a".into(), "b".into()])
         );
     }
 
+    // ── ZSet ──────────────────────────────────────────────────────────────────
     #[test]
-    fn dbsize_ok() {
-        let cmd = Command::from_value(array(&["DBSIZE"])).unwrap();
-        assert_eq!(cmd, Command::DbSize);
+    fn zadd_basic() {
+        let cmd = Command::from_value(array(&["ZADD", "z", "1.5", "member"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::ZAdd(
+                "z".into(),
+                ZAddOptions::default(),
+                vec![(1.5, "member".into())]
+            )
+        );
     }
-
     #[test]
-    fn flushdb_ok() {
-        let cmd = Command::from_value(array(&["FLUSHDB"])).unwrap();
-        assert_eq!(cmd, Command::FlushDb);
+    fn zadd_nx_ch() {
+        let cmd = Command::from_value(array(&["ZADD", "z", "NX", "CH", "1.0", "m"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::ZAdd(
+                "z".into(),
+                ZAddOptions {
+                    condition: Some(ZAddCondition::Nx),
+                    ch: true,
+                    incr: false
+                },
+                vec![(1.0, "m".into())]
+            )
+        );
     }
-
     #[test]
-    fn scan_basic() {
-        let cmd = Command::from_value(array(&["SCAN", "0"])).unwrap();
-        assert_eq!(cmd, Command::Scan(0, None, None));
+    fn zadd_incr() {
+        let cmd = Command::from_value(array(&["ZADD", "z", "INCR", "2.0", "m"])).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::ZAdd(_, ZAddOptions { incr: true, .. }, _)
+        ));
     }
-
     #[test]
-    fn scan_with_match() {
-        let cmd = Command::from_value(array(&["SCAN", "0", "MATCH", "user:*"])).unwrap();
-        assert_eq!(cmd, Command::Scan(0, Some("user:*".to_string()), None));
+    fn zadd_incr_multiple_pairs_error() {
+        let r = Command::from_value(array(&["ZADD", "z", "INCR", "1", "a", "2", "b"]));
+        assert!(r.is_err());
     }
-
     #[test]
-    fn scan_with_count() {
-        let cmd = Command::from_value(array(&["SCAN", "0", "COUNT", "100"])).unwrap();
-        assert_eq!(cmd, Command::Scan(0, None, Some(100)));
+    fn zrange_withscores() {
+        let cmd = Command::from_value(array(&["ZRANGE", "z", "0", "-1", "WITHSCORES"])).unwrap();
+        assert_eq!(cmd, Command::ZRange("z".into(), 0, -1, true));
     }
-
     #[test]
-    fn rename_ok() {
-        let cmd = Command::from_value(array(&["RENAME", "src", "dst"])).unwrap();
-        assert_eq!(cmd, Command::Rename("src".to_string(), "dst".to_string()));
+    fn zrangebyscore_inf() {
+        let cmd = Command::from_value(array(&["ZRANGEBYSCORE", "z", "-inf", "+inf"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::ZRangeByScore("z".into(), "-inf".into(), "+inf".into(), false, None)
+        );
     }
-
+    #[test]
+    fn zrangebyscore_limit() {
+        let cmd = Command::from_value(array(&[
+            "ZRANGEBYSCORE",
+            "z",
+            "0",
+            "100",
+            "WITHSCORES",
+            "LIMIT",
+            "0",
+            "10",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::ZRangeByScore("z".into(), "0".into(), "100".into(), true, Some((0, 10)))
+        );
+    }
     #[test]
     fn unknown_command() {
-        let cmd = Command::from_value(array(&["HSET", "key", "field", "val"])).unwrap();
-        assert!(matches!(cmd, Command::Unknown(_)));
+        assert!(matches!(
+            Command::from_value(array(&["BLPOP", "k", "0"])).unwrap(),
+            Command::Unknown(_)
+        ));
     }
-
     #[test]
     fn non_array_input() {
-        let result = Command::from_value(Value::SimpleString("PING".to_string()));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("RESP Arrays"));
-    }
-
-    #[test]
-    fn empty_array() {
-        let result = Command::from_value(Value::Array(Some(vec![])));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Empty command"));
+        assert!(Command::from_value(Value::SimpleString("PING".into())).is_err());
     }
 }

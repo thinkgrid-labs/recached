@@ -32,7 +32,11 @@ impl Default for RecachedCache {
 impl RecachedCache {
     #[wasm_bindgen(constructor)]
     pub fn new() -> RecachedCache {
-        RecachedCache { store: Arc::new(KeyValueStore::new()), ws: None, _onmessage: None }
+        RecachedCache {
+            store: Arc::new(KeyValueStore::new()),
+            ws: None,
+            _onmessage: None,
+        }
     }
 
     /// Connect to the native Recached backend via WebSockets.
@@ -45,9 +49,10 @@ impl RecachedCache {
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
                 let s = String::from(text);
-                if let Ok((value, _)) = Value::parse(s.as_bytes()) {
-                    if let Ok(cmd) = Command::from_value(value) {
+                if let Ok((value, _)) = Value::parse(s.as_bytes())
+                    && let Ok(cmd) = Command::from_value(value) {
                         match cmd {
+                            // Strings + expiry
                             Command::Set(_, _, _)
                             | Command::Del(_)
                             | Command::Unlink(_)
@@ -58,13 +63,35 @@ impl RecachedCache {
                             | Command::PExpireAt(_, _)
                             | Command::Persist(_)
                             | Command::FlushDb
-                            | Command::Rename(_, _) => {
+                            | Command::Rename(_, _)
+                            // Hash
+                            | Command::HSet(_, _)
+                            | Command::HDel(_, _)
+                            | Command::HSetNx(_, _, _)
+                            // List
+                            | Command::LPush(_, _)
+                            | Command::RPush(_, _)
+                            | Command::LPop(_, _)
+                            | Command::RPop(_, _)
+                            | Command::LSet(_, _, _)
+                            | Command::LRem(_, _, _)
+                            | Command::LTrim(_, _, _)
+                            // Set
+                            | Command::SAdd(_, _)
+                            | Command::SRem(_, _)
+                            | Command::SMove(_, _, _)
+                            | Command::SInterStore(_, _)
+                            | Command::SUnionStore(_, _)
+                            | Command::SDiffStore(_, _)
+                            // Sorted Set
+                            | Command::ZAdd(_, _, _)
+                            | Command::ZRem(_, _)
+                            | Command::ZIncrBy(_, _, _) => {
                                 store_clone.execute(cmd);
                             }
                             _ => {}
                         }
                     }
-                }
             }
         }) as Box<dyn FnMut(MessageEvent)>);
 
@@ -78,11 +105,10 @@ impl RecachedCache {
 
     /// Send an AUTH command to the server. The response arrives asynchronously via onmessage.
     pub fn auth(&self, password: &str) -> String {
-        if let Some(ws) = &self.ws {
-            if ws.ready_state() == WebSocket::OPEN {
+        if let Some(ws) = &self.ws
+            && ws.ready_state() == WebSocket::OPEN {
                 let _ = ws.send_with_str(&to_resp(&["AUTH", password]));
             }
-        }
         "OK".to_string()
     }
 
@@ -94,11 +120,10 @@ impl RecachedCache {
             SetOptions::default(),
         ));
 
-        if let Some(ws) = &self.ws {
-            if ws.ready_state() == WebSocket::OPEN {
+        if let Some(ws) = &self.ws
+            && ws.ready_state() == WebSocket::OPEN {
                 let _ = ws.send_with_str(&to_resp(&["SET", key, value]));
             }
-        }
 
         match resp {
             Value::SimpleString(s) => s,
@@ -113,14 +138,15 @@ impl RecachedCache {
             expiry: Some(core_engine::cmd::SetExpiry::Ex(seconds as u64)),
             ..Default::default()
         };
-        let resp =
-            self.store.execute(Command::Set(key.to_string(), value.to_string(), opts));
+        let resp = self
+            .store
+            .execute(Command::Set(key.to_string(), value.to_string(), opts));
 
-        if let Some(ws) = &self.ws {
-            if ws.ready_state() == WebSocket::OPEN {
-                let _ = ws.send_with_str(&to_resp(&["SET", key, value, "EX", &seconds.to_string()]));
+        if let Some(ws) = &self.ws
+            && ws.ready_state() == WebSocket::OPEN {
+                let _ =
+                    ws.send_with_str(&to_resp(&["SET", key, value, "EX", &seconds.to_string()]));
             }
-        }
 
         match resp {
             Value::SimpleString(s) => s,
@@ -141,11 +167,10 @@ impl RecachedCache {
     pub fn del(&self, key: &str) -> i32 {
         let resp = self.store.execute(Command::Del(vec![key.to_string()]));
 
-        if let Some(ws) = &self.ws {
-            if ws.ready_state() == WebSocket::OPEN {
+        if let Some(ws) = &self.ws
+            && ws.ready_state() == WebSocket::OPEN {
                 let _ = ws.send_with_str(&to_resp(&["DEL", key]));
             }
-        }
 
         match resp {
             Value::Integer(i) => i as i32,

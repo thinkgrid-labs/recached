@@ -1,8 +1,12 @@
-use crate::cmd::{Command, SetCondition, SetExpiry};
+use crate::cmd::{Command, SetCondition, SetExpiry, ZAddOptions};
 use crate::resp::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
+// ── time ──────────────────────────────────────────────────────────────────────
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -11,24 +15,231 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+// ── ZSet inner ────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub(crate) struct ZSetInner {
+    pub scores: HashMap<String, f64>,
+}
+
+impl ZSetInner {
+    fn new() -> Self {
+        Self {
+            scores: HashMap::new(),
+        }
+    }
+
+    /// Members sorted by (score ASC, member ASC).
+    fn rank_asc(&self) -> Vec<(&str, f64)> {
+        let mut v: Vec<(&str, f64)> = self.scores.iter().map(|(m, &s)| (m.as_str(), s)).collect();
+        v.sort_by(|(m1, s1), (m2, s2)| {
+            s1.partial_cmp(s2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(m1.cmp(m2))
+        });
+        v
+    }
+}
+
+// ── score bounds ──────────────────────────────────────────────────────────────
+
+enum ScoreBound {
+    NegInf,
+    PosInf,
+    Inclusive(f64),
+    Exclusive(f64),
+}
+
+impl ScoreBound {
+    fn parse(s: &str) -> Result<Self, Value> {
+        if s == "-inf" {
+            Ok(Self::NegInf)
+        } else if s == "+inf" || s == "inf" {
+            Ok(Self::PosInf)
+        } else if let Some(rest) = s.strip_prefix('(') {
+            rest.parse::<f64>()
+                .map(Self::Exclusive)
+                .map_err(|_| Value::Error("ERR min or max is not a float".to_string()))
+        } else {
+            s.parse::<f64>()
+                .map(Self::Inclusive)
+                .map_err(|_| Value::Error("ERR min or max is not a float".to_string()))
+        }
+    }
+}
+
+fn in_score_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
+    let above = match min {
+        ScoreBound::NegInf => true,
+        ScoreBound::PosInf => false,
+        ScoreBound::Inclusive(v) => score >= *v,
+        ScoreBound::Exclusive(v) => score > *v,
+    };
+    let below = match max {
+        ScoreBound::PosInf => true,
+        ScoreBound::NegInf => false,
+        ScoreBound::Inclusive(v) => score <= *v,
+        ScoreBound::Exclusive(v) => score < *v,
+    };
+    above && below
+}
+
+// ── Entry value type ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+enum EntryValue {
+    Str(String),
+    Hash(HashMap<String, String>),
+    List(VecDeque<String>),
+    Set(HashSet<String>),
+    ZSet(ZSetInner),
+}
+
+impl EntryValue {
+    fn type_name(&self) -> &'static str {
+        match self {
+            EntryValue::Str(_) => "string",
+            EntryValue::Hash(_) => "hash",
+            EntryValue::List(_) => "list",
+            EntryValue::Set(_) => "set",
+            EntryValue::ZSet(_) => "zset",
+        }
+    }
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
 struct Entry {
-    value: String,
+    value: EntryValue,
     expires_at_ms: Option<u64>,
 }
 
 impl Entry {
-    fn new(value: String) -> Self {
-        Self { value, expires_at_ms: None }
+    fn new_str(value: String) -> Self {
+        Self {
+            value: EntryValue::Str(value),
+            expires_at_ms: None,
+        }
     }
 
-    fn with_expiry(value: String, expires_at_ms: u64) -> Self {
-        Self { value, expires_at_ms: Some(expires_at_ms) }
+    fn new_str_ex(value: String, expires_at_ms: u64) -> Self {
+        Self {
+            value: EntryValue::Str(value),
+            expires_at_ms: Some(expires_at_ms),
+        }
     }
 
     fn is_expired(&self, now: u64) -> bool {
-        self.expires_at_ms.map_or(false, |exp| now >= exp)
+        self.expires_at_ms.is_some_and(|exp| now >= exp)
     }
 }
+
+// ── resolve list range helpers ────────────────────────────────────────────────
+
+/// Convert a possibly-negative index into an absolute index in `[0, len)`.
+fn resolve_idx(idx: i64, len: usize) -> Option<usize> {
+    let resolved = if idx >= 0 {
+        idx as usize
+    } else {
+        (len as i64 + idx) as usize
+    };
+    if resolved < len { Some(resolved) } else { None }
+}
+
+/// Clamp `start..=stop` (both possibly negative) to valid slice bounds.
+/// Returns `(start_inclusive, end_inclusive)` with `start <= end`, or `None` for empty.
+fn resolve_range(start: i64, stop: i64, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let len_i = len as i64;
+    let s = (if start < 0 { len_i + start } else { start }).max(0) as usize;
+    let e = (if stop < 0 { len_i + stop } else { stop }).min(len_i - 1);
+    if e < 0 || s >= len || s > e as usize {
+        None
+    } else {
+        Some((s, e as usize))
+    }
+}
+
+// ── zset range helpers ────────────────────────────────────────────────────────
+
+fn zrange_index<'a>(sorted: &'a [(&'a str, f64)], start: i64, stop: i64) -> &'a [(&'a str, f64)] {
+    let len = sorted.len();
+    match resolve_range(start, stop, len) {
+        None => &[],
+        Some((s, e)) => &sorted[s..=e],
+    }
+}
+
+fn apply_limit<T: Clone>(items: Vec<T>, limit: Option<(i64, i64)>) -> Vec<T> {
+    match limit {
+        None => items,
+        Some((offset, count)) => {
+            let start = offset.max(0) as usize;
+            if start >= items.len() {
+                return vec![];
+            }
+            let slice = &items[start..];
+            if count < 0 {
+                slice.to_vec()
+            } else {
+                slice[..count.min(slice.len() as i64) as usize].to_vec()
+            }
+        }
+    }
+}
+
+fn encode_zrange(items: &[(&str, f64)], withscores: bool) -> Value {
+    let mut out: Vec<Value> = Vec::with_capacity(if withscores {
+        items.len() * 2
+    } else {
+        items.len()
+    });
+    for (m, s) in items {
+        out.push(Value::BulkString(Some(m.as_bytes().to_vec())));
+        if withscores {
+            out.push(Value::BulkString(Some(format_score(*s).into_bytes())));
+        }
+    }
+    Value::Array(Some(out))
+}
+
+fn format_score(s: f64) -> String {
+    if s == f64::INFINITY {
+        "inf".to_string()
+    } else if s == f64::NEG_INFINITY {
+        "-inf".to_string()
+    } else if s.fract() == 0.0 && s.abs() < 1e15 {
+        format!("{}", s as i64)
+    } else {
+        format!("{}", s)
+    }
+}
+
+// ── macro: check entry type and prepare for mutation ─────────────────────────
+
+/// Emits code that:
+///   1. Checks if the key holds the wrong type → return WRONGTYPE error.
+///   2. Retrieves the expired flag.
+///
+/// After the macro, `was_expired` is bound; the immutable borrow of `lock` is released.
+macro_rules! type_guard {
+    ($lock:expr, $key:expr, $variant:pat, $now:expr) => {{
+        let (ok, expired) = match $lock.get($key) {
+            None => (true, false),
+            Some(e) if e.is_expired($now) => (true, true),
+            Some(e) => (matches!(&e.value, $variant), false),
+        };
+        if !ok {
+            return Value::Error(WRONGTYPE.to_string());
+        }
+        expired
+    }};
+}
+
+// ── KeyValueStore ─────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct KeyValueStore {
@@ -44,39 +255,53 @@ impl Default for KeyValueStore {
 
 impl KeyValueStore {
     pub fn new() -> Self {
-        Self { data: Arc::new(RwLock::new(HashMap::new())), max_keys: None }
+        Self {
+            data: Arc::new(RwLock::new(HashMap::new())),
+            max_keys: None,
+        }
     }
 
     pub fn with_max_keys(max: usize) -> Self {
-        Self { data: Arc::new(RwLock::new(HashMap::new())), max_keys: Some(max) }
+        Self {
+            data: Arc::new(RwLock::new(HashMap::new())),
+            max_keys: Some(max),
+        }
     }
 
-    /// Removes all expired keys. Called periodically by the native server.
     pub fn sweep_expired(&self) {
         let now = now_ms();
         let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-        lock.retain(|_, entry| !entry.is_expired(now));
+        lock.retain(|_, e| !e.is_expired(now));
     }
 
-    /// Executes a Command and returns the RESP Value to respond with.
     pub fn execute(&self, cmd: Command) -> Value {
         match cmd {
+            // ── Core ─────────────────────────────────────────────────────────
             Command::Ping(msg) => match msg {
                 Some(m) => Value::BulkString(Some(m.into_bytes())),
                 None => Value::SimpleString("PONG".to_string()),
             },
-
             Command::Auth(_) => Value::SimpleString("OK".to_string()),
 
+            // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
                 let now = now_ms();
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
 
-                let (existing_val, existing_ttl) = match lock.get(&key) {
-                    Some(e) if !e.is_expired(now) => (Some(e.value.clone()), e.expires_at_ms),
-                    _ => (None, None),
+                let (key_exists, existing_str, existing_ttl, wrongtype) = {
+                    match lock.get(&key) {
+                        None => (false, None, None, false),
+                        Some(e) if e.is_expired(now) => (false, None, None, false),
+                        Some(e) => match &e.value {
+                            EntryValue::Str(s) => (true, Some(s.clone()), e.expires_at_ms, false),
+                            _ => (true, None, e.expires_at_ms, opts.get),
+                        },
+                    }
                 };
-                let key_exists = existing_val.is_some();
+
+                if wrongtype {
+                    return Value::Error(WRONGTYPE.to_string());
+                }
 
                 let condition_met = match &opts.condition {
                     Some(SetCondition::Nx) => !key_exists,
@@ -86,7 +311,7 @@ impl KeyValueStore {
 
                 if !condition_met {
                     return if opts.get {
-                        existing_val
+                        existing_str
                             .map(|v| Value::BulkString(Some(v.into_bytes())))
                             .unwrap_or(Value::BulkString(None))
                     } else {
@@ -110,10 +335,16 @@ impl KeyValueStore {
                     Some(SetExpiry::KeepTtl) => existing_ttl,
                 };
 
-                lock.insert(key, Entry { value: val, expires_at_ms });
+                lock.insert(
+                    key,
+                    Entry {
+                        value: EntryValue::Str(val),
+                        expires_at_ms,
+                    },
+                );
 
                 if opts.get {
-                    existing_val
+                    existing_str
                         .map(|v| Value::BulkString(Some(v.into_bytes())))
                         .unwrap_or(Value::BulkString(None))
                 } else {
@@ -125,36 +356,51 @@ impl KeyValueStore {
                 let now = now_ms();
                 let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
                 match lock.get(&key) {
-                    Some(e) if !e.is_expired(now) => {
-                        Value::BulkString(Some(e.value.clone().into_bytes()))
-                    }
+                    Some(e) if !e.is_expired(now) => match &e.value {
+                        EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
                     _ => Value::BulkString(None),
                 }
             }
 
             Command::Del(keys) | Command::Unlink(keys) => {
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                let count = keys.into_iter().filter(|k| lock.remove(k).is_some()).count();
+                let count = keys
+                    .into_iter()
+                    .filter(|k| lock.remove(k).is_some())
+                    .count();
                 Value::Integer(count as i64)
             }
 
             Command::Append(key, suffix) => {
                 let now = now_ms();
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                let entry = lock.entry(key).or_insert_with(|| Entry::new(String::new()));
-                if entry.is_expired(now) {
-                    entry.value = String::new();
+                let was_expired = type_guard!(lock, &key, EntryValue::Str(_), now);
+                let entry = lock
+                    .entry(key)
+                    .or_insert_with(|| Entry::new_str(String::new()));
+                if was_expired {
+                    entry.value = EntryValue::Str(String::new());
                     entry.expires_at_ms = None;
                 }
-                entry.value.push_str(&suffix);
-                Value::Integer(entry.value.len() as i64)
+                match &mut entry.value {
+                    EntryValue::Str(s) => {
+                        s.push_str(&suffix);
+                        Value::Integer(s.len() as i64)
+                    }
+                    _ => unreachable!(),
+                }
             }
 
             Command::Strlen(key) => {
                 let now = now_ms();
                 let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
                 match lock.get(&key) {
-                    Some(e) if !e.is_expired(now) => Value::Integer(e.value.len() as i64),
+                    Some(e) if !e.is_expired(now) => match &e.value {
+                        EntryValue::Str(s) => Value::Integer(s.len() as i64),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
                     _ => Value::Integer(0),
                 }
             }
@@ -162,12 +408,14 @@ impl KeyValueStore {
             Command::GetSet(key, new_val) => {
                 let now = now_ms();
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                let old = lock
-                    .get(&key)
-                    .filter(|e| !e.is_expired(now))
-                    .map(|e| Value::BulkString(Some(e.value.clone().into_bytes())))
-                    .unwrap_or(Value::BulkString(None));
-                lock.insert(key, Entry::new(new_val));
+                let old = match lock.get(&key) {
+                    Some(e) if !e.is_expired(now) => match &e.value {
+                        EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+                        _ => return Value::Error(WRONGTYPE.to_string()),
+                    },
+                    _ => Value::BulkString(None),
+                };
+                lock.insert(key, Entry::new_str(new_val));
                 old
             }
 
@@ -177,9 +425,10 @@ impl KeyValueStore {
                 let results = keys
                     .iter()
                     .map(|k| match lock.get(k) {
-                        Some(e) if !e.is_expired(now) => {
-                            Value::BulkString(Some(e.value.clone().into_bytes()))
-                        }
+                        Some(e) if !e.is_expired(now) => match &e.value {
+                            EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+                            _ => Value::BulkString(None),
+                        },
                         _ => Value::BulkString(None),
                     })
                     .collect();
@@ -189,14 +438,13 @@ impl KeyValueStore {
             Command::MSet(pairs) => {
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(max) = self.max_keys {
-                    let new_count =
-                        pairs.iter().filter(|(k, _)| !lock.contains_key(k)).count();
+                    let new_count = pairs.iter().filter(|(k, _)| !lock.contains_key(k)).count();
                     if lock.len() + new_count > max {
                         return Value::Error("ERR max keys limit reached".to_string());
                     }
                 }
                 for (k, v) in pairs {
-                    lock.insert(k, Entry::new(v));
+                    lock.insert(k, Entry::new_str(v));
                 }
                 Value::SimpleString("OK".to_string())
             }
@@ -204,7 +452,7 @@ impl KeyValueStore {
             Command::SetNx(key, val) => {
                 let now = now_ms();
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                let exists = lock.get(&key).map_or(false, |e| !e.is_expired(now));
+                let exists = lock.get(&key).is_some_and(|e| !e.is_expired(now));
                 if exists {
                     return Value::Integer(0);
                 }
@@ -214,13 +462,13 @@ impl KeyValueStore {
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
-                lock.insert(key, Entry::new(val));
+                lock.insert(key, Entry::new_str(val));
                 Value::Integer(1)
             }
 
             Command::SetEx(key, secs, val) => {
                 let now = now_ms();
-                let expires_at_ms = now.saturating_add(secs.saturating_mul(1000));
+                let exp = now.saturating_add(secs.saturating_mul(1000));
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(max) = self.max_keys
                     && lock.len() >= max
@@ -228,13 +476,13 @@ impl KeyValueStore {
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
-                lock.insert(key, Entry::with_expiry(val, expires_at_ms));
+                lock.insert(key, Entry::new_str_ex(val, exp));
                 Value::SimpleString("OK".to_string())
             }
 
             Command::PSetEx(key, ms, val) => {
                 let now = now_ms();
-                let expires_at_ms = now.saturating_add(ms);
+                let exp = now.saturating_add(ms);
                 let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(max) = self.max_keys
                     && lock.len() >= max
@@ -242,7 +490,7 @@ impl KeyValueStore {
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
-                lock.insert(key, Entry::with_expiry(val, expires_at_ms));
+                lock.insert(key, Entry::new_str_ex(val, exp));
                 Value::SimpleString("OK".to_string())
             }
 
@@ -251,53 +499,15 @@ impl KeyValueStore {
             Command::IncrBy(key, delta) => incr_by(&self.data, key, delta),
             Command::DecrBy(key, delta) => incr_by(&self.data, key, -delta),
 
-            Command::Expire(key, secs) => {
-                let now = now_ms();
-                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                match lock.get_mut(&key) {
-                    Some(e) if !e.is_expired(now) => {
-                        e.expires_at_ms = Some(now.saturating_add(secs.saturating_mul(1000)));
-                        Value::Integer(1)
-                    }
-                    _ => Value::Integer(0),
-                }
-            }
-
-            Command::PExpire(key, ms) => {
-                let now = now_ms();
-                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                match lock.get_mut(&key) {
-                    Some(e) if !e.is_expired(now) => {
-                        e.expires_at_ms = Some(now.saturating_add(ms));
-                        Value::Integer(1)
-                    }
-                    _ => Value::Integer(0),
-                }
-            }
-
-            Command::ExpireAt(key, ts_secs) => {
-                let now = now_ms();
-                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                match lock.get_mut(&key) {
-                    Some(e) if !e.is_expired(now) => {
-                        e.expires_at_ms = Some(ts_secs.saturating_mul(1000));
-                        Value::Integer(1)
-                    }
-                    _ => Value::Integer(0),
-                }
-            }
-
-            Command::PExpireAt(key, ts_ms) => {
-                let now = now_ms();
-                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
-                match lock.get_mut(&key) {
-                    Some(e) if !e.is_expired(now) => {
-                        e.expires_at_ms = Some(ts_ms);
-                        Value::Integer(1)
-                    }
-                    _ => Value::Integer(0),
-                }
-            }
+            // ── Expiry ────────────────────────────────────────────────────────
+            Command::Expire(key, secs) => set_expiry(
+                &self.data,
+                key,
+                now_ms().saturating_add(secs.saturating_mul(1000)),
+            ),
+            Command::PExpire(key, ms) => set_expiry(&self.data, key, now_ms().saturating_add(ms)),
+            Command::ExpireAt(key, ts) => set_expiry(&self.data, key, ts.saturating_mul(1000)),
+            Command::PExpireAt(key, ts) => set_expiry(&self.data, key, ts),
 
             Command::Ttl(key) => {
                 let now = now_ms();
@@ -338,12 +548,13 @@ impl KeyValueStore {
                 }
             }
 
+            // ── Keys ──────────────────────────────────────────────────────────
             Command::Exists(keys) => {
                 let now = now_ms();
                 let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
                 let count = keys
                     .iter()
-                    .filter(|k| lock.get(*k).map_or(false, |e| !e.is_expired(now)))
+                    .filter(|k| lock.get(*k).is_some_and(|e| !e.is_expired(now)))
                     .count();
                 Value::Integer(count as i64)
             }
@@ -357,8 +568,16 @@ impl KeyValueStore {
                     .map(|(k, _)| Value::BulkString(Some(k.as_bytes().to_vec())))
                     .collect();
                 keys.sort_unstable_by(|a, b| {
-                    let ka = if let Value::BulkString(Some(d)) = a { d.as_slice() } else { &[] };
-                    let kb = if let Value::BulkString(Some(d)) = b { d.as_slice() } else { &[] };
+                    let ka = if let Value::BulkString(Some(d)) = a {
+                        d.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let kb = if let Value::BulkString(Some(d)) = b {
+                        d.as_slice()
+                    } else {
+                        &[]
+                    };
                     ka.cmp(kb)
                 });
                 Value::Array(Some(keys))
@@ -388,8 +607,7 @@ impl KeyValueStore {
             Command::DbSize => {
                 let now = now_ms();
                 let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
-                let count = lock.values().filter(|e| !e.is_expired(now)).count();
-                Value::Integer(count as i64)
+                Value::Integer(lock.values().filter(|e| !e.is_expired(now)).count() as i64)
             }
 
             Command::FlushDb => {
@@ -416,34 +634,1099 @@ impl KeyValueStore {
                 let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
                 match lock.get(&key) {
                     Some(e) if !e.is_expired(now) => {
-                        Value::SimpleString("string".to_string())
+                        Value::SimpleString(e.value.type_name().to_string())
                     }
                     _ => Value::SimpleString("none".to_string()),
                 }
             }
+
+            // ── Hash ──────────────────────────────────────────────────────────
+            Command::HSet(key, pairs) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let was_expired = type_guard!(lock, &key, EntryValue::Hash(_), now);
+                let entry = lock.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::Hash(HashMap::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired {
+                    entry.value = EntryValue::Hash(HashMap::new());
+                    entry.expires_at_ms = None;
+                }
+                let h = match &mut entry.value {
+                    EntryValue::Hash(h) => h,
+                    _ => unreachable!(),
+                };
+                let new_count = pairs
+                    .iter()
+                    .filter(|(f, _)| !h.contains_key(f.as_str()))
+                    .count();
+                for (field, val) in pairs {
+                    h.insert(field, val);
+                }
+                Value::Integer(new_count as i64)
+            }
+
+            Command::HGet(key, field) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::BulkString(None),
+                    Some(e) if e.is_expired(now) => Value::BulkString(None),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => h
+                            .get(&field)
+                            .map(|v| Value::BulkString(Some(v.clone().into_bytes())))
+                            .unwrap_or(Value::BulkString(None)),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HGetAll(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(vec![])),
+                    Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => {
+                            let mut pairs: Vec<(&str, &str)> =
+                                h.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
+                            pairs.sort_unstable_by_key(|(f, _)| *f);
+                            let out = pairs
+                                .into_iter()
+                                .flat_map(|(f, v)| {
+                                    [
+                                        Value::BulkString(Some(f.as_bytes().to_vec())),
+                                        Value::BulkString(Some(v.as_bytes().to_vec())),
+                                    ]
+                                })
+                                .collect();
+                            Value::Array(Some(out))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HDel(key, fields) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &mut e.value {
+                        EntryValue::Hash(h) => {
+                            let count =
+                                fields.into_iter().filter(|f| h.remove(f).is_some()).count();
+                            Value::Integer(count as i64)
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HKeys(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(vec![])),
+                    Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => {
+                            let mut keys: Vec<&str> = h.keys().map(|s| s.as_str()).collect();
+                            keys.sort_unstable();
+                            Value::Array(Some(
+                                keys.into_iter()
+                                    .map(|k| Value::BulkString(Some(k.as_bytes().to_vec())))
+                                    .collect(),
+                            ))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HVals(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(vec![])),
+                    Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => {
+                            let mut pairs: Vec<(&str, &str)> =
+                                h.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
+                            pairs.sort_unstable_by_key(|(f, _)| *f);
+                            Value::Array(Some(
+                                pairs
+                                    .into_iter()
+                                    .map(|(_, v)| Value::BulkString(Some(v.as_bytes().to_vec())))
+                                    .collect(),
+                            ))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HLen(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => Value::Integer(h.len() as i64),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HIncrBy(key, field, delta) => hash_incr_int(&self.data, key, field, delta),
+
+            Command::HIncrByFloat(key, field, delta) => {
+                hash_incr_float(&self.data, key, field, delta)
+            }
+
+            Command::HExists(key, field) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => {
+                            Value::Integer(if h.contains_key(&field) { 1 } else { 0 })
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HSetNx(key, field, val) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let was_expired = type_guard!(lock, &key, EntryValue::Hash(_), now);
+                let entry = lock.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::Hash(HashMap::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired {
+                    entry.value = EntryValue::Hash(HashMap::new());
+                    entry.expires_at_ms = None;
+                }
+                let h = match &mut entry.value {
+                    EntryValue::Hash(h) => h,
+                    _ => unreachable!(),
+                };
+                if let std::collections::hash_map::Entry::Vacant(e) = h.entry(field) {
+                    e.insert(val);
+                    Value::Integer(1)
+                } else {
+                    Value::Integer(0)
+                }
+            }
+
+            Command::HMGet(key, fields) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(
+                        fields.iter().map(|_| Value::BulkString(None)).collect(),
+                    )),
+                    Some(e) if e.is_expired(now) => Value::Array(Some(
+                        fields.iter().map(|_| Value::BulkString(None)).collect(),
+                    )),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => Value::Array(Some(
+                            fields
+                                .iter()
+                                .map(|f| {
+                                    h.get(f)
+                                        .map(|v| Value::BulkString(Some(v.clone().into_bytes())))
+                                        .unwrap_or(Value::BulkString(None))
+                                })
+                                .collect(),
+                        )),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            // ── List ──────────────────────────────────────────────────────────
+            Command::LPush(key, vals) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let was_expired = type_guard!(lock, &key, EntryValue::List(_), now);
+                let entry = lock.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::List(VecDeque::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired {
+                    entry.value = EntryValue::List(VecDeque::new());
+                    entry.expires_at_ms = None;
+                }
+                let list = match &mut entry.value {
+                    EntryValue::List(l) => l,
+                    _ => unreachable!(),
+                };
+                for v in vals {
+                    list.push_front(v);
+                }
+                Value::Integer(list.len() as i64)
+            }
+
+            Command::RPush(key, vals) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let was_expired = type_guard!(lock, &key, EntryValue::List(_), now);
+                let entry = lock.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::List(VecDeque::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired {
+                    entry.value = EntryValue::List(VecDeque::new());
+                    entry.expires_at_ms = None;
+                }
+                let list = match &mut entry.value {
+                    EntryValue::List(l) => l,
+                    _ => unreachable!(),
+                };
+                for v in vals {
+                    list.push_back(v);
+                }
+                Value::Integer(list.len() as i64)
+            }
+
+            Command::LPushX(key, vals) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &mut e.value {
+                        EntryValue::List(list) => {
+                            for v in vals {
+                                list.push_front(v);
+                            }
+                            Value::Integer(list.len() as i64)
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::RPushX(key, vals) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &mut e.value {
+                        EntryValue::List(list) => {
+                            for v in vals {
+                                list.push_back(v);
+                            }
+                            Value::Integer(list.len() as i64)
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::LPop(key, count) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => no_list_response(count),
+                    Some(e) if e.is_expired(now) => no_list_response(count),
+                    Some(e) => match &mut e.value {
+                        EntryValue::List(list) => {
+                            if let Some(n) = count {
+                                let items: Vec<Value> = (0..n)
+                                    .filter_map(|_| {
+                                        list.pop_front()
+                                            .map(|v| Value::BulkString(Some(v.into_bytes())))
+                                    })
+                                    .collect();
+                                Value::Array(Some(items))
+                            } else {
+                                list.pop_front()
+                                    .map(|v| Value::BulkString(Some(v.into_bytes())))
+                                    .unwrap_or(Value::BulkString(None))
+                            }
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::RPop(key, count) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => no_list_response(count),
+                    Some(e) if e.is_expired(now) => no_list_response(count),
+                    Some(e) => match &mut e.value {
+                        EntryValue::List(list) => {
+                            if let Some(n) = count {
+                                let items: Vec<Value> = (0..n)
+                                    .filter_map(|_| {
+                                        list.pop_back()
+                                            .map(|v| Value::BulkString(Some(v.into_bytes())))
+                                    })
+                                    .collect();
+                                Value::Array(Some(items))
+                            } else {
+                                list.pop_back()
+                                    .map(|v| Value::BulkString(Some(v.into_bytes())))
+                                    .unwrap_or(Value::BulkString(None))
+                            }
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::LRange(key, start, stop) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(vec![])),
+                    Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
+                    Some(e) => match &e.value {
+                        EntryValue::List(list) => {
+                            let slice: Vec<&String> = list.iter().collect();
+                            match resolve_range(start, stop, slice.len()) {
+                                None => Value::Array(Some(vec![])),
+                                Some((s, e)) => Value::Array(Some(
+                                    slice[s..=e]
+                                        .iter()
+                                        .map(|v| Value::BulkString(Some(v.as_bytes().to_vec())))
+                                        .collect(),
+                                )),
+                            }
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::LLen(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &e.value {
+                        EntryValue::List(l) => Value::Integer(l.len() as i64),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::LIndex(key, idx) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::BulkString(None),
+                    Some(e) if e.is_expired(now) => Value::BulkString(None),
+                    Some(e) => match &e.value {
+                        EntryValue::List(list) => {
+                            let slice: Vec<&String> = list.iter().collect();
+                            resolve_idx(idx, slice.len())
+                                .map(|i| Value::BulkString(Some(slice[i].as_bytes().to_vec())))
+                                .unwrap_or(Value::BulkString(None))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::LSet(key, idx, val) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::Error("ERR no such key".to_string()),
+                    Some(e) if e.is_expired(now) => Value::Error("ERR no such key".to_string()),
+                    Some(e) => match &mut e.value {
+                        EntryValue::List(list) => {
+                            let len = list.len();
+                            match resolve_idx(idx, len) {
+                                None => Value::Error("ERR index out of range".to_string()),
+                                Some(i) => {
+                                    list[i] = val;
+                                    Value::SimpleString("OK".to_string())
+                                }
+                            }
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::LRem(key, count, element) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &mut e.value {
+                        EntryValue::List(list) => {
+                            let mut removed = 0i64;
+                            let abs = count.unsigned_abs() as usize;
+                            if count >= 0 {
+                                let mut i = 0;
+                                while i < list.len() && (count == 0 || removed < abs as i64) {
+                                    if list[i] == element {
+                                        list.remove(i);
+                                        removed += 1;
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                            } else {
+                                let mut i = list.len();
+                                while i > 0 && removed < abs as i64 {
+                                    i -= 1;
+                                    if list[i] == element {
+                                        list.remove(i);
+                                        removed += 1;
+                                    }
+                                }
+                            }
+                            Value::Integer(removed)
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::LTrim(key, start, stop) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::SimpleString("OK".to_string()),
+                    Some(e) if e.is_expired(now) => Value::SimpleString("OK".to_string()),
+                    Some(e) => match &mut e.value {
+                        EntryValue::List(list) => {
+                            let len = list.len();
+                            match resolve_range(start, stop, len) {
+                                None => list.clear(),
+                                Some((s, e)) => {
+                                    let trimmed: VecDeque<String> = list.drain(s..=e).collect();
+                                    *list = trimmed;
+                                }
+                            }
+                            Value::SimpleString("OK".to_string())
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            // ── Set ───────────────────────────────────────────────────────────
+            Command::SAdd(key, members) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let was_expired = type_guard!(lock, &key, EntryValue::Set(_), now);
+                let entry = lock.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::Set(HashSet::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired {
+                    entry.value = EntryValue::Set(HashSet::new());
+                    entry.expires_at_ms = None;
+                }
+                let set = match &mut entry.value {
+                    EntryValue::Set(s) => s,
+                    _ => unreachable!(),
+                };
+                let added = members
+                    .into_iter()
+                    .filter(|m| set.insert(m.clone()))
+                    .count();
+                Value::Integer(added as i64)
+            }
+
+            Command::SMembers(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(vec![])),
+                    Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
+                    Some(e) => match &e.value {
+                        EntryValue::Set(s) => {
+                            let mut members: Vec<&str> = s.iter().map(|m| m.as_str()).collect();
+                            members.sort_unstable();
+                            Value::Array(Some(
+                                members
+                                    .into_iter()
+                                    .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
+                                    .collect(),
+                            ))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SRem(key, members) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &mut e.value {
+                        EntryValue::Set(s) => {
+                            let removed = members.into_iter().filter(|m| s.remove(m)).count();
+                            Value::Integer(removed as i64)
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SCard(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &e.value {
+                        EntryValue::Set(s) => Value::Integer(s.len() as i64),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SIsMember(key, member) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &e.value {
+                        EntryValue::Set(s) => {
+                            Value::Integer(if s.contains(&member) { 1 } else { 0 })
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SMIsMember(key, members) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(members.iter().map(|_| Value::Integer(0)).collect())),
+                    Some(e) if e.is_expired(now) => {
+                        Value::Array(Some(members.iter().map(|_| Value::Integer(0)).collect()))
+                    }
+                    Some(e) => match &e.value {
+                        EntryValue::Set(s) => Value::Array(Some(
+                            members
+                                .iter()
+                                .map(|m| Value::Integer(if s.contains(m) { 1 } else { 0 }))
+                                .collect(),
+                        )),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SInter(keys) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match set_inter(&lock, &keys, now) {
+                    Err(e) => e,
+                    Ok(result) => set_to_value(result),
+                }
+            }
+
+            Command::SInterStore(dst, keys) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let result = {
+                    match set_inter(&lock, &keys, now) {
+                        Err(e) => return e,
+                        Ok(r) => r,
+                    }
+                };
+                let len = result.len();
+                lock.insert(
+                    dst,
+                    Entry {
+                        value: EntryValue::Set(result),
+                        expires_at_ms: None,
+                    },
+                );
+                Value::Integer(len as i64)
+            }
+
+            Command::SUnion(keys) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match set_union(&lock, &keys, now) {
+                    Err(e) => e,
+                    Ok(result) => set_to_value(result),
+                }
+            }
+
+            Command::SUnionStore(dst, keys) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let result = {
+                    match set_union(&lock, &keys, now) {
+                        Err(e) => return e,
+                        Ok(r) => r,
+                    }
+                };
+                let len = result.len();
+                lock.insert(
+                    dst,
+                    Entry {
+                        value: EntryValue::Set(result),
+                        expires_at_ms: None,
+                    },
+                );
+                Value::Integer(len as i64)
+            }
+
+            Command::SDiff(keys) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match set_diff(&lock, &keys, now) {
+                    Err(e) => e,
+                    Ok(result) => set_to_value(result),
+                }
+            }
+
+            Command::SDiffStore(dst, keys) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let result = {
+                    match set_diff(&lock, &keys, now) {
+                        Err(e) => return e,
+                        Ok(r) => r,
+                    }
+                };
+                let len = result.len();
+                lock.insert(
+                    dst,
+                    Entry {
+                        value: EntryValue::Set(result),
+                        expires_at_ms: None,
+                    },
+                );
+                Value::Integer(len as i64)
+            }
+
+            Command::SPop(key, count) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => no_list_response(count),
+                    Some(e) if e.is_expired(now) => no_list_response(count),
+                    Some(e) => match &mut e.value {
+                        EntryValue::Set(s) => {
+                            let n = count.unwrap_or(1) as usize;
+                            let popped: Vec<String> = s.iter().take(n).cloned().collect();
+                            for m in &popped {
+                                s.remove(m);
+                            }
+                            if count.is_some() {
+                                Value::Array(Some(
+                                    popped
+                                        .into_iter()
+                                        .map(|m| Value::BulkString(Some(m.into_bytes())))
+                                        .collect(),
+                                ))
+                            } else {
+                                popped
+                                    .into_iter()
+                                    .next()
+                                    .map(|m| Value::BulkString(Some(m.into_bytes())))
+                                    .unwrap_or(Value::BulkString(None))
+                            }
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SRandMember(key, count) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => match count {
+                        None => Value::BulkString(None),
+                        Some(_) => Value::Array(Some(vec![])),
+                    },
+                    Some(e) if e.is_expired(now) => match count {
+                        None => Value::BulkString(None),
+                        Some(_) => Value::Array(Some(vec![])),
+                    },
+                    Some(e) => match &e.value {
+                        EntryValue::Set(s) => match count {
+                            None => s
+                                .iter()
+                                .next()
+                                .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
+                                .unwrap_or(Value::BulkString(None)),
+                            Some(n) if n >= 0 => {
+                                let mut members: Vec<&str> =
+                                    s.iter().map(|m| m.as_str()).take(n as usize).collect();
+                                members.sort_unstable();
+                                Value::Array(Some(
+                                    members
+                                        .into_iter()
+                                        .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
+                                        .collect(),
+                                ))
+                            }
+                            Some(n) => {
+                                // Negative: allow repetition, return |n| elements
+                                let members: Vec<&str> = s.iter().map(|m| m.as_str()).collect();
+                                let abs = n.unsigned_abs() as usize;
+                                Value::Array(Some(
+                                    (0..abs)
+                                        .map(|i| {
+                                            let m = members[i % members.len()];
+                                            Value::BulkString(Some(m.as_bytes().to_vec()))
+                                        })
+                                        .collect(),
+                                ))
+                            }
+                        },
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SMove(src, dst, member) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                // Check types
+                let src_type_ok = match lock.get(&src) {
+                    None => true,
+                    Some(e) if e.is_expired(now) => true,
+                    Some(e) => matches!(&e.value, EntryValue::Set(_)),
+                };
+                let dst_type_ok = match lock.get(&dst) {
+                    None => true,
+                    Some(e) if e.is_expired(now) => true,
+                    Some(e) => matches!(&e.value, EntryValue::Set(_)),
+                };
+                if !src_type_ok || !dst_type_ok {
+                    return Value::Error(WRONGTYPE.to_string());
+                }
+                // Remove from source
+                let removed = match lock.get_mut(&src) {
+                    Some(e) if !e.is_expired(now) => {
+                        if let EntryValue::Set(s) = &mut e.value {
+                            s.remove(&member)
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if !removed {
+                    return Value::Integer(0);
+                }
+                // Add to destination
+                let was_expired_dst = matches!(lock.get(&dst), Some(e) if e.is_expired(now));
+                let dst_entry = lock.entry(dst).or_insert_with(|| Entry {
+                    value: EntryValue::Set(HashSet::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired_dst {
+                    dst_entry.value = EntryValue::Set(HashSet::new());
+                    dst_entry.expires_at_ms = None;
+                }
+                if let EntryValue::Set(s) = &mut dst_entry.value {
+                    s.insert(member);
+                }
+                Value::Integer(1)
+            }
+
+            // ── Sorted Set ────────────────────────────────────────────────────
+            Command::ZAdd(key, opts, pairs) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let was_expired = type_guard!(lock, &key, EntryValue::ZSet(_), now);
+                let entry = lock.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::ZSet(ZSetInner::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired {
+                    entry.value = EntryValue::ZSet(ZSetInner::new());
+                    entry.expires_at_ms = None;
+                }
+                let zset = match &mut entry.value {
+                    EntryValue::ZSet(z) => z,
+                    _ => unreachable!(),
+                };
+                zadd_exec(zset, opts, pairs)
+            }
+
+            Command::ZRange(key, start, stop, withscores) => zset_read(&self.data, &key, |zset| {
+                let sorted = zset.rank_asc();
+                Ok(encode_zrange(
+                    zrange_index(&sorted, start, stop),
+                    withscores,
+                ))
+            }),
+
+            Command::ZRevRange(key, start, stop, withscores) => {
+                zset_read(&self.data, &key, |zset| {
+                    let mut sorted = zset.rank_asc();
+                    sorted.reverse();
+                    Ok(encode_zrange(
+                        zrange_index(&sorted, start, stop),
+                        withscores,
+                    ))
+                })
+            }
+
+            Command::ZRangeByScore(key, min_s, max_s, withscores, limit) => {
+                zset_read(&self.data, &key, |zset| {
+                    let min = ScoreBound::parse(&min_s)?;
+                    let max = ScoreBound::parse(&max_s)?;
+                    let filtered: Vec<(&str, f64)> = zset
+                        .rank_asc()
+                        .into_iter()
+                        .filter(|(_, s)| in_score_range(*s, &min, &max))
+                        .collect();
+                    let limited = apply_limit(filtered, limit);
+                    Ok(encode_zrange(&limited, withscores))
+                })
+            }
+
+            Command::ZRevRangeByScore(key, max_s, min_s, withscores, limit) => {
+                zset_read(&self.data, &key, |zset| {
+                    let min = ScoreBound::parse(&min_s)?;
+                    let max = ScoreBound::parse(&max_s)?;
+                    let filtered: Vec<(&str, f64)> = {
+                        let mut v: Vec<(&str, f64)> = zset
+                            .rank_asc()
+                            .into_iter()
+                            .filter(|(_, s)| in_score_range(*s, &min, &max))
+                            .collect();
+                        v.reverse();
+                        v
+                    };
+                    let limited = apply_limit(filtered, limit);
+                    Ok(encode_zrange(&limited, withscores))
+                })
+            }
+
+            Command::ZScore(key, member) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::BulkString(None),
+                    Some(e) if e.is_expired(now) => Value::BulkString(None),
+                    Some(e) => match &e.value {
+                        EntryValue::ZSet(z) => z
+                            .scores
+                            .get(&member)
+                            .map(|s| Value::BulkString(Some(format_score(*s).into_bytes())))
+                            .unwrap_or(Value::BulkString(None)),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::ZMScore(key, members) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Array(Some(
+                        members.iter().map(|_| Value::BulkString(None)).collect(),
+                    )),
+                    Some(e) if e.is_expired(now) => Value::Array(Some(
+                        members.iter().map(|_| Value::BulkString(None)).collect(),
+                    )),
+                    Some(e) => match &e.value {
+                        EntryValue::ZSet(z) => Value::Array(Some(
+                            members
+                                .iter()
+                                .map(|m| {
+                                    z.scores
+                                        .get(m)
+                                        .map(|s| {
+                                            Value::BulkString(Some(format_score(*s).into_bytes()))
+                                        })
+                                        .unwrap_or(Value::BulkString(None))
+                                })
+                                .collect(),
+                        )),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::ZRank(key, member) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::BulkString(None),
+                    Some(e) if e.is_expired(now) => Value::BulkString(None),
+                    Some(e) => match &e.value {
+                        EntryValue::ZSet(z) => z
+                            .rank_asc()
+                            .iter()
+                            .position(|(m, _)| *m == member)
+                            .map(|i| Value::Integer(i as i64))
+                            .unwrap_or(Value::BulkString(None)),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::ZRevRank(key, member) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::BulkString(None),
+                    Some(e) if e.is_expired(now) => Value::BulkString(None),
+                    Some(e) => match &e.value {
+                        EntryValue::ZSet(z) => {
+                            let sorted = z.rank_asc();
+                            let len = sorted.len();
+                            sorted
+                                .iter()
+                                .position(|(m, _)| *m == member)
+                                .map(|i| Value::Integer((len - 1 - i) as i64))
+                                .unwrap_or(Value::BulkString(None))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::ZRem(key, members) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                match lock.get_mut(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &mut e.value {
+                        EntryValue::ZSet(z) => {
+                            let removed = members
+                                .iter()
+                                .filter(|m| z.scores.remove(*m).is_some())
+                                .count();
+                            Value::Integer(removed as i64)
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::ZCard(key) => {
+                let now = now_ms();
+                let lock = self.data.read().unwrap_or_else(|e| e.into_inner());
+                match lock.get(&key) {
+                    None => Value::Integer(0),
+                    Some(e) if e.is_expired(now) => Value::Integer(0),
+                    Some(e) => match &e.value {
+                        EntryValue::ZSet(z) => Value::Integer(z.scores.len() as i64),
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::ZIncrBy(key, delta, member) => {
+                let now = now_ms();
+                let mut lock = self.data.write().unwrap_or_else(|e| e.into_inner());
+                let was_expired = type_guard!(lock, &key, EntryValue::ZSet(_), now);
+                let entry = lock.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::ZSet(ZSetInner::new()),
+                    expires_at_ms: None,
+                });
+                if was_expired {
+                    entry.value = EntryValue::ZSet(ZSetInner::new());
+                    entry.expires_at_ms = None;
+                }
+                let zset = match &mut entry.value {
+                    EntryValue::ZSet(z) => z,
+                    _ => unreachable!(),
+                };
+                let score = zset
+                    .scores
+                    .entry(member)
+                    .and_modify(|s| *s += delta)
+                    .or_insert(delta);
+                let new_score = *score;
+                Value::BulkString(Some(format_score(new_score).into_bytes()))
+            }
+
+            Command::ZCount(key, min_s, max_s) => zset_read(&self.data, &key, |zset| {
+                let min = ScoreBound::parse(&min_s)?;
+                let max = ScoreBound::parse(&max_s)?;
+                let count = zset
+                    .scores
+                    .values()
+                    .filter(|&&s| in_score_range(s, &min, &max))
+                    .count();
+                Ok(Value::Integer(count as i64))
+            }),
 
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
         }
     }
 }
 
+// ── Free helpers ──────────────────────────────────────────────────────────────
+
 fn incr_by(data: &Arc<RwLock<HashMap<String, Entry>>>, key: String, delta: i64) -> Value {
     let now = now_ms();
     let mut lock = data.write().unwrap_or_else(|e| e.into_inner());
-    let entry = lock.entry(key).or_insert_with(|| Entry::new("0".to_string()));
-    if entry.is_expired(now) {
-        entry.value = "0".to_string();
+    let was_expired = match lock.get(&key) {
+        None => false,
+        Some(e) if e.is_expired(now) => true,
+        Some(e) => match &e.value {
+            EntryValue::Str(_) => false,
+            _ => return Value::Error(WRONGTYPE.to_string()),
+        },
+    };
+    let entry = lock
+        .entry(key)
+        .or_insert_with(|| Entry::new_str("0".to_string()));
+    if was_expired {
+        entry.value = EntryValue::Str("0".to_string());
         entry.expires_at_ms = None;
     }
-    match entry.value.parse::<i64>() {
-        Err(_) => Value::Error("ERR value is not an integer or out of range".to_string()),
-        Ok(current) => match current.checked_add(delta) {
-            None => Value::Error("ERR increment or decrement would overflow".to_string()),
-            Some(new_val) => {
-                entry.value = new_val.to_string();
-                Value::Integer(new_val)
-            }
+    match &mut entry.value {
+        EntryValue::Str(s) => match s.parse::<i64>() {
+            Err(_) => Value::Error("ERR value is not an integer or out of range".to_string()),
+            Ok(n) => match n.checked_add(delta) {
+                None => Value::Error("ERR increment or decrement would overflow".to_string()),
+                Some(new) => {
+                    *s = new.to_string();
+                    Value::Integer(new)
+                }
+            },
         },
+        _ => unreachable!(),
+    }
+}
+
+fn set_expiry(data: &Arc<RwLock<HashMap<String, Entry>>>, key: String, ts_ms: u64) -> Value {
+    let now = now_ms();
+    let mut lock = data.write().unwrap_or_else(|e| e.into_inner());
+    match lock.get_mut(&key) {
+        None => Value::Integer(0),
+        Some(e) if e.is_expired(now) => Value::Integer(0),
+        Some(e) => {
+            e.expires_at_ms = Some(ts_ms);
+            Value::Integer(1)
+        }
     }
 }
 
@@ -451,272 +1734,754 @@ fn glob_match(pattern: &str, s: &str) -> bool {
     glob_helper(pattern.as_bytes(), s.as_bytes())
 }
 
-fn glob_helper(p: &[u8], s: &[u8]) -> bool {
-    match (p.first(), s.first()) {
+fn glob_helper(pat: &[u8], s: &[u8]) -> bool {
+    match (pat.first(), s.first()) {
         (None, None) => true,
-        (None, _) => false,
-        (Some(&b'*'), None) => glob_helper(&p[1..], s),
-        (Some(&b'*'), _) => glob_helper(&p[1..], s) || glob_helper(p, &s[1..]),
-        (_, None) => false,
-        (Some(&b'?'), _) => glob_helper(&p[1..], &s[1..]),
-        (Some(&pc), Some(&sc)) if pc == sc => glob_helper(&p[1..], &s[1..]),
+        (None, Some(_)) => false,
+        (Some(b'*'), _) => {
+            glob_helper(&pat[1..], s) || (!s.is_empty() && glob_helper(pat, &s[1..]))
+        }
+        (Some(b'?'), Some(_)) => glob_helper(&pat[1..], &s[1..]),
+        (Some(b'?'), None) => false,
+        (Some(p), Some(c)) if p == c => glob_helper(&pat[1..], &s[1..]),
         _ => false,
     }
 }
 
+fn no_list_response(count: Option<u64>) -> Value {
+    if count.is_some() {
+        Value::Array(Some(vec![]))
+    } else {
+        Value::BulkString(None)
+    }
+}
+
+fn set_to_value(mut result: HashSet<String>) -> Value {
+    let mut members: Vec<String> = result.drain().collect();
+    members.sort_unstable();
+    Value::Array(Some(
+        members
+            .into_iter()
+            .map(|m| Value::BulkString(Some(m.into_bytes())))
+            .collect(),
+    ))
+}
+
+fn set_inter(
+    lock: &HashMap<String, Entry>,
+    keys: &[String],
+    now: u64,
+) -> Result<HashSet<String>, Value> {
+    if keys.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut sets: Vec<Option<&HashSet<String>>> = Vec::with_capacity(keys.len());
+    for k in keys {
+        match lock.get(k) {
+            None => sets.push(None),
+            Some(e) if e.is_expired(now) => sets.push(None),
+            Some(e) => match &e.value {
+                EntryValue::Set(s) => sets.push(Some(s)),
+                _ => return Err(Value::Error(WRONGTYPE.to_string())),
+            },
+        }
+    }
+    if sets.iter().any(|s| s.is_none()) {
+        return Ok(HashSet::new());
+    }
+    let non_empty: Vec<&HashSet<String>> = sets.into_iter().flatten().collect();
+    let mut result: HashSet<String> = non_empty[0].iter().cloned().collect();
+    for s in &non_empty[1..] {
+        result.retain(|m| s.contains(m));
+    }
+    Ok(result)
+}
+
+fn set_union(
+    lock: &HashMap<String, Entry>,
+    keys: &[String],
+    now: u64,
+) -> Result<HashSet<String>, Value> {
+    let mut result: HashSet<String> = HashSet::new();
+    for k in keys {
+        match lock.get(k) {
+            None => {}
+            Some(e) if e.is_expired(now) => {}
+            Some(e) => match &e.value {
+                EntryValue::Set(s) => result.extend(s.iter().cloned()),
+                _ => return Err(Value::Error(WRONGTYPE.to_string())),
+            },
+        }
+    }
+    Ok(result)
+}
+
+fn set_diff(
+    lock: &HashMap<String, Entry>,
+    keys: &[String],
+    now: u64,
+) -> Result<HashSet<String>, Value> {
+    if keys.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut result: HashSet<String> = match lock.get(&keys[0]) {
+        None => HashSet::new(),
+        Some(e) if e.is_expired(now) => HashSet::new(),
+        Some(e) => match &e.value {
+            EntryValue::Set(s) => s.iter().cloned().collect(),
+            _ => return Err(Value::Error(WRONGTYPE.to_string())),
+        },
+    };
+    for k in &keys[1..] {
+        match lock.get(k) {
+            None => {}
+            Some(e) if e.is_expired(now) => {}
+            Some(e) => match &e.value {
+                EntryValue::Set(s) => result.retain(|m| !s.contains(m)),
+                _ => return Err(Value::Error(WRONGTYPE.to_string())),
+            },
+        }
+    }
+    Ok(result)
+}
+
+fn hash_incr_int(
+    data: &Arc<RwLock<HashMap<String, Entry>>>,
+    key: String,
+    field: String,
+    delta: i64,
+) -> Value {
+    let now = now_ms();
+    let mut lock = data.write().unwrap_or_else(|e| e.into_inner());
+    let was_expired = match lock.get(&key) {
+        None => false,
+        Some(e) if e.is_expired(now) => true,
+        Some(e) => match &e.value {
+            EntryValue::Hash(_) => false,
+            _ => return Value::Error(WRONGTYPE.to_string()),
+        },
+    };
+    let entry = lock.entry(key).or_insert_with(|| Entry {
+        value: EntryValue::Hash(HashMap::new()),
+        expires_at_ms: None,
+    });
+    if was_expired {
+        entry.value = EntryValue::Hash(HashMap::new());
+        entry.expires_at_ms = None;
+    }
+    let h = match &mut entry.value {
+        EntryValue::Hash(h) => h,
+        _ => unreachable!(),
+    };
+    let cur: i64 = h.get(&field).and_then(|s| s.parse().ok()).unwrap_or(0);
+    match cur.checked_add(delta) {
+        None => Value::Error("ERR increment or decrement would overflow".to_string()),
+        Some(new) => {
+            h.insert(field, new.to_string());
+            Value::Integer(new)
+        }
+    }
+}
+
+fn hash_incr_float(
+    data: &Arc<RwLock<HashMap<String, Entry>>>,
+    key: String,
+    field: String,
+    delta: f64,
+) -> Value {
+    let now = now_ms();
+    let mut lock = data.write().unwrap_or_else(|e| e.into_inner());
+    let was_expired = match lock.get(&key) {
+        None => false,
+        Some(e) if e.is_expired(now) => true,
+        Some(e) => match &e.value {
+            EntryValue::Hash(_) => false,
+            _ => return Value::Error(WRONGTYPE.to_string()),
+        },
+    };
+    let entry = lock.entry(key).or_insert_with(|| Entry {
+        value: EntryValue::Hash(HashMap::new()),
+        expires_at_ms: None,
+    });
+    if was_expired {
+        entry.value = EntryValue::Hash(HashMap::new());
+        entry.expires_at_ms = None;
+    }
+    let h = match &mut entry.value {
+        EntryValue::Hash(h) => h,
+        _ => unreachable!(),
+    };
+    let cur: f64 = h.get(&field).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let new = cur + delta;
+    if new.is_nan() || new.is_infinite() {
+        return Value::Error("ERR increment would produce NaN or Infinity".to_string());
+    }
+    let new_str = format_score(new);
+    h.insert(field, new_str.clone());
+    Value::BulkString(Some(new_str.into_bytes()))
+}
+
+fn zset_read<F>(data: &Arc<RwLock<HashMap<String, Entry>>>, key: &str, f: F) -> Value
+where
+    F: FnOnce(&ZSetInner) -> Result<Value, Value>,
+{
+    let now = now_ms();
+    let lock = data.read().unwrap_or_else(|e| e.into_inner());
+    let empty = ZSetInner::new();
+    let result = match lock.get(key) {
+        None => f(&empty),
+        Some(e) if e.is_expired(now) => f(&empty),
+        Some(e) => match &e.value {
+            EntryValue::ZSet(z) => f(z),
+            _ => return Value::Error(WRONGTYPE.to_string()),
+        },
+    };
+    match result {
+        Ok(v) | Err(v) => v,
+    }
+}
+
+fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>) -> Value {
+    use crate::cmd::ZAddCondition;
+
+    if opts.incr {
+        let (delta, member) = match pairs.into_iter().next() {
+            Some(p) => p,
+            None => return Value::BulkString(None),
+        };
+        let score = zset
+            .scores
+            .entry(member)
+            .and_modify(|s| *s += delta)
+            .or_insert(delta);
+        return Value::BulkString(Some(format_score(*score).into_bytes()));
+    }
+
+    let mut added = 0i64;
+    let mut changed = 0i64;
+    for (score, member) in pairs {
+        match &opts.condition {
+            Some(ZAddCondition::Nx) => {
+                if let std::collections::hash_map::Entry::Vacant(e) = zset.scores.entry(member) {
+                    e.insert(score);
+                    added += 1;
+                    changed += 1;
+                }
+            }
+            Some(ZAddCondition::Xx) => {
+                if let Some(s) = zset.scores.get_mut(&member)
+                    && (*s - score).abs() > f64::EPSILON {
+                        *s = score;
+                        changed += 1;
+                    }
+            }
+            None => {
+                let old = zset.scores.insert(member, score);
+                match old {
+                    None => {
+                        added += 1;
+                        changed += 1;
+                    }
+                    Some(old_score) if (old_score - score).abs() > f64::EPSILON => {
+                        changed += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Value::Integer(if opts.ch { changed } else { added })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::{Command, SetOptions, ZAddOptions};
+
+    fn store() -> KeyValueStore {
+        KeyValueStore::new()
+    }
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    fn int(n: i64) -> Value {
+        Value::Integer(n)
+    }
+
+    fn ok() -> Value {
+        Value::SimpleString("OK".to_string())
+    }
+
+    fn nil() -> Value {
+        Value::BulkString(None)
+    }
+
+    fn arr(items: &[&str]) -> Value {
+        Value::Array(Some(items.iter().map(|s| bulk(s)).collect()))
+    }
+
+    // ── Hash ──────────────────────────────────────────────────────────────────
 
     #[test]
-    fn set_and_get() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set(
-            "k".to_string(),
-            "v".to_string(),
-            Default::default(),
+    fn hash_basic() {
+        let s = store();
+        assert_eq!(
+            s.execute(Command::HSet(
+                "h".into(),
+                vec![("f1".into(), "v1".into()), ("f2".into(), "v2".into())]
+            )),
+            int(2)
+        );
+        assert_eq!(
+            s.execute(Command::HGet("h".into(), "f1".into())),
+            bulk("v1")
+        );
+        assert_eq!(
+            s.execute(Command::HGet("h".into(), "f2".into())),
+            bulk("v2")
+        );
+        assert_eq!(s.execute(Command::HGet("h".into(), "nope".into())), nil());
+        assert_eq!(s.execute(Command::HLen("h".into())), int(2));
+    }
+
+    #[test]
+    fn hash_getall_sorted() {
+        let s = store();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![("b".into(), "2".into()), ("a".into(), "1".into())],
+        ));
+        // HGETALL returns field-value pairs sorted by field
+        let res = s.execute(Command::HGetAll("h".into()));
+        assert_eq!(res, arr(&["a", "1", "b", "2"]));
+    }
+
+    #[test]
+    fn hash_del() {
+        let s = store();
+        s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
+        assert_eq!(
+            s.execute(Command::HDel("h".into(), vec!["f".into()])),
+            int(1)
+        );
+        assert_eq!(
+            s.execute(Command::HDel("h".into(), vec!["f".into()])),
+            int(0)
+        );
+        assert_eq!(s.execute(Command::HGet("h".into(), "f".into())), nil());
+    }
+
+    #[test]
+    fn hash_incr() {
+        let s = store();
+        assert_eq!(
+            s.execute(Command::HIncrBy("h".into(), "n".into(), 5)),
+            int(5)
+        );
+        assert_eq!(
+            s.execute(Command::HIncrBy("h".into(), "n".into(), 3)),
+            int(8)
+        );
+        let res = s.execute(Command::HIncrByFloat("h".into(), "f".into(), 1.5));
+        assert_eq!(res, bulk("1.5"));
+    }
+
+    #[test]
+    fn hash_hsetnx() {
+        let s = store();
+        assert_eq!(
+            s.execute(Command::HSetNx("h".into(), "f".into(), "v1".into())),
+            int(1)
+        );
+        assert_eq!(
+            s.execute(Command::HSetNx("h".into(), "f".into(), "v2".into())),
+            int(0)
+        );
+        assert_eq!(s.execute(Command::HGet("h".into(), "f".into())), bulk("v1"));
+    }
+
+    #[test]
+    fn hash_hmget() {
+        let s = store();
+        s.execute(Command::HSet("h".into(), vec![("a".into(), "1".into())]));
+        let res = s.execute(Command::HMGet("h".into(), vec!["a".into(), "b".into()]));
+        assert_eq!(res, Value::Array(Some(vec![bulk("1"), nil()])));
+    }
+
+    #[test]
+    fn hash_wrongtype() {
+        let s = store();
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        let res = s.execute(Command::HGet("k".into(), "f".into()));
+        assert!(matches!(res, Value::Error(e) if e.contains("WRONGTYPE")));
+    }
+
+    // ── List ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_push_pop() {
+        let s = store();
+        assert_eq!(
+            s.execute(Command::RPush("l".into(), vec!["a".into(), "b".into()])),
+            int(2)
+        );
+        assert_eq!(
+            s.execute(Command::LPush("l".into(), vec!["z".into()])),
+            int(3)
+        );
+        // list is now: z a b
+        assert_eq!(s.execute(Command::LPop("l".into(), None)), bulk("z"));
+        assert_eq!(s.execute(Command::RPop("l".into(), None)), bulk("b"));
+        assert_eq!(s.execute(Command::LLen("l".into())), int(1));
+    }
+
+    #[test]
+    fn list_lrange() {
+        let s = store();
+        s.execute(Command::RPush(
+            "l".into(),
+            vec!["a".into(), "b".into(), "c".into()],
         ));
         assert_eq!(
-            store.execute(Command::Get("k".to_string())),
-            Value::BulkString(Some(b"v".to_vec()))
+            s.execute(Command::LRange("l".into(), 0, -1)),
+            arr(&["a", "b", "c"])
         );
-    }
-
-    #[test]
-    fn get_missing() {
-        let store = KeyValueStore::new();
-        assert_eq!(store.execute(Command::Get("x".to_string())), Value::BulkString(None));
-    }
-
-    #[test]
-    fn del_returns_count() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("a".to_string(), "1".to_string(), Default::default()));
-        store.execute(Command::Set("b".to_string(), "2".to_string(), Default::default()));
         assert_eq!(
-            store.execute(Command::Del(vec!["a".to_string(), "b".to_string(), "z".to_string()])),
-            Value::Integer(2)
+            s.execute(Command::LRange("l".into(), 1, 2)),
+            arr(&["b", "c"])
         );
+        assert_eq!(s.execute(Command::LRange("l".into(), 0, 0)), arr(&["a"]));
     }
 
     #[test]
-    fn set_ex_expires() {
-        let store = KeyValueStore::new();
-        // Use PX 1 so it expires after 1ms
-        let opts = crate::cmd::SetOptions {
-            expiry: Some(SetExpiry::Px(1)),
-            ..Default::default()
-        };
-        store.execute(Command::Set("k".to_string(), "v".to_string(), opts));
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        assert_eq!(store.execute(Command::Get("k".to_string())), Value::BulkString(None));
+    fn list_lindex_lset() {
+        let s = store();
+        s.execute(Command::RPush("l".into(), vec!["a".into(), "b".into()]));
+        assert_eq!(s.execute(Command::LIndex("l".into(), 0)), bulk("a"));
+        assert_eq!(s.execute(Command::LIndex("l".into(), -1)), bulk("b"));
+        assert_eq!(s.execute(Command::LSet("l".into(), 0, "x".into())), ok());
+        assert_eq!(s.execute(Command::LIndex("l".into(), 0)), bulk("x"));
     }
 
     #[test]
-    fn ttl_no_expiry() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("k".to_string(), "v".to_string(), Default::default()));
-        assert_eq!(store.execute(Command::Ttl("k".to_string())), Value::Integer(-1));
-    }
-
-    #[test]
-    fn ttl_missing_key() {
-        let store = KeyValueStore::new();
-        assert_eq!(store.execute(Command::Ttl("x".to_string())), Value::Integer(-2));
-    }
-
-    #[test]
-    fn ttl_with_expiry() {
-        let store = KeyValueStore::new();
-        store.execute(Command::SetEx("k".to_string(), 100, "v".to_string()));
-        match store.execute(Command::Ttl("k".to_string())) {
-            Value::Integer(n) => assert!(n > 90 && n <= 100, "TTL out of range: {}", n),
-            other => panic!("expected integer, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn persist_removes_ttl() {
-        let store = KeyValueStore::new();
-        store.execute(Command::SetEx("k".to_string(), 60, "v".to_string()));
-        assert_eq!(store.execute(Command::Persist("k".to_string())), Value::Integer(1));
-        assert_eq!(store.execute(Command::Ttl("k".to_string())), Value::Integer(-1));
-    }
-
-    #[test]
-    fn incr_from_zero() {
-        let store = KeyValueStore::new();
-        assert_eq!(store.execute(Command::Incr("c".to_string())), Value::Integer(1));
-        assert_eq!(store.execute(Command::Incr("c".to_string())), Value::Integer(2));
-    }
-
-    #[test]
-    fn incr_existing() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("c".to_string(), "10".to_string(), Default::default()));
-        assert_eq!(store.execute(Command::IncrBy("c".to_string(), 5)), Value::Integer(15));
-    }
-
-    #[test]
-    fn incr_non_integer() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("k".to_string(), "foo".to_string(), Default::default()));
-        assert!(matches!(store.execute(Command::Incr("k".to_string())), Value::Error(_)));
-    }
-
-    #[test]
-    fn mget_mset() {
-        let store = KeyValueStore::new();
-        store.execute(Command::MSet(vec![
-            ("a".to_string(), "1".to_string()),
-            ("b".to_string(), "2".to_string()),
-        ]));
-        assert_eq!(
-            store.execute(Command::MGet(vec!["a".to_string(), "b".to_string(), "c".to_string()])),
-            Value::Array(Some(vec![
-                Value::BulkString(Some(b"1".to_vec())),
-                Value::BulkString(Some(b"2".to_vec())),
-                Value::BulkString(None),
-            ]))
-        );
-    }
-
-    #[test]
-    fn setnx_only_sets_once() {
-        let store = KeyValueStore::new();
-        assert_eq!(store.execute(Command::SetNx("k".to_string(), "first".to_string())), Value::Integer(1));
-        assert_eq!(store.execute(Command::SetNx("k".to_string(), "second".to_string())), Value::Integer(0));
-        assert_eq!(
-            store.execute(Command::Get("k".to_string())),
-            Value::BulkString(Some(b"first".to_vec()))
-        );
-    }
-
-    #[test]
-    fn exists_counts_duplicates() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("a".to_string(), "1".to_string(), Default::default()));
-        // EXISTS a a b — a exists twice, b doesn't: count = 2
-        assert_eq!(
-            store.execute(Command::Exists(vec!["a".to_string(), "a".to_string(), "b".to_string()])),
-            Value::Integer(2)
-        );
-    }
-
-    #[test]
-    fn dbsize_counts_live_keys() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("a".to_string(), "1".to_string(), Default::default()));
-        store.execute(Command::Set("b".to_string(), "2".to_string(), Default::default()));
-        assert_eq!(store.execute(Command::DbSize), Value::Integer(2));
-    }
-
-    #[test]
-    fn flushdb_clears_all() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("a".to_string(), "1".to_string(), Default::default()));
-        store.execute(Command::FlushDb);
-        assert_eq!(store.execute(Command::DbSize), Value::Integer(0));
-    }
-
-    #[test]
-    fn rename_moves_key() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("src".to_string(), "hello".to_string(), Default::default()));
-        store.execute(Command::Rename("src".to_string(), "dst".to_string()));
-        assert_eq!(store.execute(Command::Get("src".to_string())), Value::BulkString(None));
-        assert_eq!(
-            store.execute(Command::Get("dst".to_string())),
-            Value::BulkString(Some(b"hello".to_vec()))
-        );
-    }
-
-    #[test]
-    fn rename_missing_key_errors() {
-        let store = KeyValueStore::new();
-        assert!(matches!(
-            store.execute(Command::Rename("nope".to_string(), "dst".to_string())),
-            Value::Error(_)
+    fn list_lrem() {
+        let s = store();
+        s.execute(Command::RPush(
+            "l".into(),
+            vec!["a".into(), "b".into(), "a".into(), "c".into()],
         ));
-    }
-
-    #[test]
-    fn type_returns_string_or_none() {
-        let store = KeyValueStore::new();
+        assert_eq!(s.execute(Command::LRem("l".into(), 1, "a".into())), int(1));
         assert_eq!(
-            store.execute(Command::Type("x".to_string())),
-            Value::SimpleString("none".to_string())
-        );
-        store.execute(Command::Set("x".to_string(), "v".to_string(), Default::default()));
-        assert_eq!(
-            store.execute(Command::Type("x".to_string())),
-            Value::SimpleString("string".to_string())
+            s.execute(Command::LRange("l".into(), 0, -1)),
+            arr(&["b", "a", "c"])
         );
     }
 
     #[test]
-    fn keys_glob_star() {
-        let store = KeyValueStore::new();
-        store.execute(Command::Set("user:1".to_string(), "a".to_string(), Default::default()));
-        store.execute(Command::Set("user:2".to_string(), "b".to_string(), Default::default()));
-        store.execute(Command::Set("session:1".to_string(), "c".to_string(), Default::default()));
-        match store.execute(Command::Keys("user:*".to_string())) {
-            Value::Array(Some(keys)) => {
-                assert_eq!(keys.len(), 2);
-            }
-            other => panic!("expected array, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn glob_question_mark() {
-        assert!(glob_match("h?llo", "hello"));
-        assert!(glob_match("h?llo", "hallo"));
-        assert!(!glob_match("h?llo", "hllo"));
-    }
-
-    #[test]
-    fn glob_star() {
-        assert!(glob_match("h*llo", "hello"));
-        assert!(glob_match("h*llo", "heeello"));
-        assert!(glob_match("*", "anything"));
-        assert!(!glob_match("h*llo", "world"));
-    }
-
-    #[test]
-    fn set_nx_condition() {
-        let store = KeyValueStore::new();
-        let opts_nx = crate::cmd::SetOptions {
-            condition: Some(SetCondition::Nx),
-            ..Default::default()
-        };
-        // First SET NX should succeed
+    fn list_ltrim() {
+        let s = store();
+        s.execute(Command::RPush(
+            "l".into(),
+            vec!["a".into(), "b".into(), "c".into()],
+        ));
+        s.execute(Command::LTrim("l".into(), 1, 2));
         assert_eq!(
-            store.execute(Command::Set("k".to_string(), "first".to_string(), opts_nx.clone())),
-            Value::SimpleString("OK".to_string())
-        );
-        // Second SET NX should fail (key exists)
-        assert_eq!(
-            store.execute(Command::Set("k".to_string(), "second".to_string(), opts_nx)),
-            Value::BulkString(None)
-        );
-        assert_eq!(
-            store.execute(Command::Get("k".to_string())),
-            Value::BulkString(Some(b"first".to_vec()))
+            s.execute(Command::LRange("l".into(), 0, -1)),
+            arr(&["b", "c"])
         );
     }
 
     #[test]
-    fn sweep_removes_expired() {
-        let store = KeyValueStore::new();
-        let opts = crate::cmd::SetOptions {
-            expiry: Some(SetExpiry::Px(1)),
-            ..Default::default()
-        };
-        store.execute(Command::Set("k".to_string(), "v".to_string(), opts));
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        store.sweep_expired();
-        // After sweep, DBSIZE should be 0
-        assert_eq!(store.execute(Command::DbSize), Value::Integer(0));
+    fn list_wrongtype() {
+        let s = store();
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        let res = s.execute(Command::LPush("k".into(), vec!["x".into()]));
+        assert!(matches!(res, Value::Error(e) if e.contains("WRONGTYPE")));
+    }
+
+    // ── Set ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_basic() {
+        let s = store();
+        assert_eq!(
+            s.execute(Command::SAdd("s".into(), vec!["a".into(), "b".into()])),
+            int(2)
+        );
+        assert_eq!(
+            s.execute(Command::SAdd("s".into(), vec!["a".into()])),
+            int(0)
+        );
+        assert_eq!(s.execute(Command::SCard("s".into())), int(2));
+        assert_eq!(
+            s.execute(Command::SIsMember("s".into(), "a".into())),
+            int(1)
+        );
+        assert_eq!(
+            s.execute(Command::SIsMember("s".into(), "z".into())),
+            int(0)
+        );
+    }
+
+    #[test]
+    fn set_smembers_sorted() {
+        let s = store();
+        s.execute(Command::SAdd(
+            "s".into(),
+            vec!["c".into(), "a".into(), "b".into()],
+        ));
+        assert_eq!(
+            s.execute(Command::SMembers("s".into())),
+            arr(&["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn set_rem() {
+        let s = store();
+        s.execute(Command::SAdd("s".into(), vec!["a".into(), "b".into()]));
+        assert_eq!(
+            s.execute(Command::SRem("s".into(), vec!["a".into()])),
+            int(1)
+        );
+        assert_eq!(s.execute(Command::SCard("s".into())), int(1));
+    }
+
+    #[test]
+    fn set_inter_union_diff() {
+        let s = store();
+        s.execute(Command::SAdd(
+            "a".into(),
+            vec!["1".into(), "2".into(), "3".into()],
+        ));
+        s.execute(Command::SAdd(
+            "b".into(),
+            vec!["2".into(), "3".into(), "4".into()],
+        ));
+
+        let inter = s.execute(Command::SInter(vec!["a".into(), "b".into()]));
+        assert_eq!(inter, arr(&["2", "3"]));
+
+        let union = s.execute(Command::SUnion(vec!["a".into(), "b".into()]));
+        assert_eq!(union, arr(&["1", "2", "3", "4"]));
+
+        let diff = s.execute(Command::SDiff(vec!["a".into(), "b".into()]));
+        assert_eq!(diff, arr(&["1"]));
+    }
+
+    #[test]
+    fn set_smove() {
+        let s = store();
+        s.execute(Command::SAdd("src".into(), vec!["m".into()]));
+        assert_eq!(
+            s.execute(Command::SMove("src".into(), "dst".into(), "m".into())),
+            int(1)
+        );
+        assert_eq!(
+            s.execute(Command::SIsMember("src".into(), "m".into())),
+            int(0)
+        );
+        assert_eq!(
+            s.execute(Command::SIsMember("dst".into(), "m".into())),
+            int(1)
+        );
+    }
+
+    #[test]
+    fn set_wrongtype() {
+        let s = store();
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        let res = s.execute(Command::SAdd("k".into(), vec!["x".into()]));
+        assert!(matches!(res, Value::Error(e) if e.contains("WRONGTYPE")));
+    }
+
+    // ── Sorted Set ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn zset_zadd_zrange() {
+        let s = store();
+        assert_eq!(
+            s.execute(Command::ZAdd(
+                "z".into(),
+                ZAddOptions::default(),
+                vec![(1.0, "a".into()), (2.0, "b".into())]
+            )),
+            int(2)
+        );
+        assert_eq!(
+            s.execute(Command::ZRange("z".into(), 0, -1, false)),
+            arr(&["a", "b"])
+        );
+        assert_eq!(
+            s.execute(Command::ZRevRange("z".into(), 0, -1, false)),
+            arr(&["b", "a"])
+        );
+    }
+
+    #[test]
+    fn zset_withscores() {
+        let s = store();
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(1.0, "a".into())],
+        ));
+        let res = s.execute(Command::ZRange("z".into(), 0, -1, true));
+        assert_eq!(res, arr(&["a", "1"]));
+    }
+
+    #[test]
+    fn zset_zscore_zrank() {
+        let s = store();
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(5.0, "a".into()), (3.0, "b".into())],
+        ));
+        assert_eq!(
+            s.execute(Command::ZScore("z".into(), "a".into())),
+            bulk("5")
+        );
+        assert_eq!(s.execute(Command::ZRank("z".into(), "b".into())), int(0));
+        assert_eq!(s.execute(Command::ZRevRank("z".into(), "b".into())), int(1));
+    }
+
+    #[test]
+    fn zset_zincrby() {
+        let s = store();
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(1.0, "m".into())],
+        ));
+        assert_eq!(
+            s.execute(Command::ZIncrBy("z".into(), 2.5, "m".into())),
+            bulk("3.5")
+        );
+        assert_eq!(
+            s.execute(Command::ZScore("z".into(), "m".into())),
+            bulk("3.5")
+        );
+        // New member
+        assert_eq!(
+            s.execute(Command::ZIncrBy("z".into(), 10.0, "new".into())),
+            bulk("10")
+        );
+    }
+
+    #[test]
+    fn zset_zrem_zcard() {
+        let s = store();
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(1.0, "a".into()), (2.0, "b".into())],
+        ));
+        assert_eq!(
+            s.execute(Command::ZRem("z".into(), vec!["a".into()])),
+            int(1)
+        );
+        assert_eq!(s.execute(Command::ZCard("z".into())), int(1));
+    }
+
+    #[test]
+    fn zset_zrangebyscore() {
+        let s = store();
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(1.0, "a".into()), (2.0, "b".into()), (3.0, "c".into())],
+        ));
+        assert_eq!(
+            s.execute(Command::ZRangeByScore(
+                "z".into(),
+                "1".into(),
+                "2".into(),
+                false,
+                None
+            )),
+            arr(&["a", "b"])
+        );
+        assert_eq!(
+            s.execute(Command::ZRangeByScore(
+                "z".into(),
+                "(1".into(),
+                "+inf".into(),
+                false,
+                None
+            )),
+            arr(&["b", "c"])
+        );
+        assert_eq!(
+            s.execute(Command::ZCount("z".into(), "-inf".into(), "2".into())),
+            int(2)
+        );
+    }
+
+    #[test]
+    fn zset_zadd_nx_xx() {
+        let s = store();
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(1.0, "m".into())],
+        ));
+        // NX: don't update existing
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions {
+                condition: Some(crate::cmd::ZAddCondition::Nx),
+                ..Default::default()
+            },
+            vec![(99.0, "m".into())],
+        ));
+        assert_eq!(
+            s.execute(Command::ZScore("z".into(), "m".into())),
+            bulk("1")
+        );
+        // XX: update existing only
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions {
+                condition: Some(crate::cmd::ZAddCondition::Xx),
+                ..Default::default()
+            },
+            vec![(5.0, "m".into()), (5.0, "new".into())],
+        ));
+        assert_eq!(
+            s.execute(Command::ZScore("z".into(), "m".into())),
+            bulk("5")
+        );
+        assert_eq!(s.execute(Command::ZScore("z".into(), "new".into())), nil());
+    }
+
+    #[test]
+    fn zset_wrongtype() {
+        let s = store();
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        let res = s.execute(Command::ZAdd(
+            "k".into(),
+            ZAddOptions::default(),
+            vec![(1.0, "m".into())],
+        ));
+        assert!(matches!(res, Value::Error(e) if e.contains("WRONGTYPE")));
+    }
+
+    // ── Cross-type TTL ────────────────────────────────────────────────────────
+
+    #[test]
+    fn collection_ttl_expire() {
+        let s = store();
+        s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
+        assert_eq!(s.execute(Command::Expire("h".into(), 60)), int(1));
+        assert_eq!(s.execute(Command::HGet("h".into(), "f".into())), bulk("v"));
+        // Force expiry by manipulating via PEXPIRE with 0ms
+        s.execute(Command::PExpire("h".into(), 0));
+        // Now lazy-expired
+        assert_eq!(s.execute(Command::HGet("h".into(), "f".into())), nil());
     }
 }
