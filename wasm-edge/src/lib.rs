@@ -1,4 +1,4 @@
-use core_engine::cmd::Command;
+use core_engine::cmd::{Command, SetOptions};
 use core_engine::resp::Value;
 use core_engine::store::KeyValueStore;
 use std::sync::Arc;
@@ -32,11 +32,7 @@ impl Default for RecachedCache {
 impl RecachedCache {
     #[wasm_bindgen(constructor)]
     pub fn new() -> RecachedCache {
-        RecachedCache {
-            store: Arc::new(KeyValueStore::new()),
-            ws: None,
-            _onmessage: None,
-        }
+        RecachedCache { store: Arc::new(KeyValueStore::new()), ws: None, _onmessage: None }
     }
 
     /// Connect to the native Recached backend via WebSockets.
@@ -45,14 +41,24 @@ impl RecachedCache {
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
 
-        // Incoming messages from the server are RESP-encoded mutation commands (SET / DEL).
+        // Incoming messages from the server are RESP-encoded mutation commands.
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
                 let s = String::from(text);
                 if let Ok((value, _)) = Value::parse(s.as_bytes()) {
                     if let Ok(cmd) = Command::from_value(value) {
                         match cmd {
-                            Command::Set(_, _) | Command::Del(_) => {
+                            Command::Set(_, _, _)
+                            | Command::Del(_)
+                            | Command::Unlink(_)
+                            | Command::MSet(_)
+                            | Command::Expire(_, _)
+                            | Command::PExpire(_, _)
+                            | Command::ExpireAt(_, _)
+                            | Command::PExpireAt(_, _)
+                            | Command::Persist(_)
+                            | Command::FlushDb
+                            | Command::Rename(_, _) => {
                                 store_clone.execute(cmd);
                             }
                             _ => {}
@@ -82,13 +88,37 @@ impl RecachedCache {
 
     /// Set a key-value pair locally and sync to the server.
     pub fn set(&self, key: &str, value: &str) -> String {
-        let resp = self
-            .store
-            .execute(Command::Set(key.to_string(), value.to_string()));
+        let resp = self.store.execute(Command::Set(
+            key.to_string(),
+            value.to_string(),
+            SetOptions::default(),
+        ));
 
         if let Some(ws) = &self.ws {
             if ws.ready_state() == WebSocket::OPEN {
                 let _ = ws.send_with_str(&to_resp(&["SET", key, value]));
+            }
+        }
+
+        match resp {
+            Value::SimpleString(s) => s,
+            Value::Error(e) => e,
+            _ => "ERR".to_string(),
+        }
+    }
+
+    /// Set a key with a TTL in seconds, synced to the server.
+    pub fn set_ex(&self, key: &str, value: &str, seconds: u32) -> String {
+        let opts = SetOptions {
+            expiry: Some(core_engine::cmd::SetExpiry::Ex(seconds as u64)),
+            ..Default::default()
+        };
+        let resp =
+            self.store.execute(Command::Set(key.to_string(), value.to_string(), opts));
+
+        if let Some(ws) = &self.ws {
+            if ws.ready_state() == WebSocket::OPEN {
+                let _ = ws.send_with_str(&to_resp(&["SET", key, value, "EX", &seconds.to_string()]));
             }
         }
 
@@ -121,5 +151,21 @@ impl RecachedCache {
             Value::Integer(i) => i as i32,
             _ => 0,
         }
+    }
+
+    /// Get the TTL of a key in seconds (-1 = no TTL, -2 = key doesn't exist).
+    pub fn ttl(&self, key: &str) -> i32 {
+        match self.store.execute(Command::Ttl(key.to_string())) {
+            Value::Integer(n) => n as i32,
+            _ => -2,
+        }
+    }
+
+    /// Check if a key exists in the local store.
+    pub fn exists(&self, key: &str) -> bool {
+        matches!(
+            self.store.execute(Command::Exists(vec![key.to_string()])),
+            Value::Integer(1)
+        )
     }
 }

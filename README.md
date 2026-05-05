@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="recached.png" alt="Recached" width="200" />
+  <img src="recached.jpg" alt="Recached" width="800" />
   <h1>Recached ⚡</h1>
   <p><b>A Rust cache server that runs on your backend <em>and</em> inside the browser.</b></p>
 

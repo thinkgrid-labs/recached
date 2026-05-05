@@ -1,4 +1,4 @@
-use core_engine::cmd::Command;
+use core_engine::cmd::{Command, SetExpiry};
 use core_engine::resp::Value;
 use core_engine::store::KeyValueStore;
 use futures_util::{SinkExt, StreamExt};
@@ -19,6 +19,7 @@ const TCP_READ_BUFFER_BYTES: usize = 4096;
 const BROADCAST_CHANNEL_CAPACITY: usize = 512;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_AUTH_FAILURES: u32 = 5;
+const EVICTION_INTERVAL_SECS: u64 = 1;
 
 // ── connection identity ──────────────────────────────────────────────────────
 
@@ -38,6 +39,120 @@ fn resp_command(parts: &[&str]) -> String {
         s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
     }
     s
+}
+
+/// Returns the RESP-encoded mutation to broadcast to WebSocket peers, or `None`
+/// if the command mutated nothing (read-only or conditional-and-failed).
+fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
+    match cmd {
+        Command::Set(k, v, opts) => {
+            // Without GET: nil response means NX/XX condition failed — don't broadcast.
+            // With GET: nil means key didn't exist before, but SET still happened.
+            let set_happened = opts.get || !matches!(response, Value::BulkString(None));
+            if !set_happened {
+                return None;
+            }
+            match &opts.expiry {
+                None => Some(resp_command(&["SET", k, v])),
+                Some(SetExpiry::Ex(s)) => {
+                    let px = s.saturating_mul(1000).to_string();
+                    Some(resp_command(&["SET", k, v, "PX", &px]))
+                }
+                Some(SetExpiry::Px(ms)) => {
+                    let ms_s = ms.to_string();
+                    Some(resp_command(&["SET", k, v, "PX", &ms_s]))
+                }
+                Some(SetExpiry::Exat(ts)) => {
+                    let pxat = ts.saturating_mul(1000).to_string();
+                    Some(resp_command(&["SET", k, v, "PXAT", &pxat]))
+                }
+                Some(SetExpiry::Pxat(ts)) => {
+                    let ts_s = ts.to_string();
+                    Some(resp_command(&["SET", k, v, "PXAT", &ts_s]))
+                }
+                Some(SetExpiry::KeepTtl) => Some(resp_command(&["SET", k, v, "KEEPTTL"])),
+            }
+        }
+        Command::Del(keys) | Command::Unlink(keys) => {
+            let mut parts: Vec<&str> = vec!["DEL"];
+            let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            parts.extend_from_slice(&key_refs);
+            Some(resp_command(&parts))
+        }
+        Command::MSet(pairs) => {
+            let mut parts: Vec<&str> = vec!["MSET"];
+            let flat: Vec<String> =
+                pairs.iter().flat_map(|(k, v)| [k.clone(), v.clone()]).collect();
+            let flat_refs: Vec<&str> = flat.iter().map(|s| s.as_str()).collect();
+            parts.extend_from_slice(&flat_refs);
+            Some(resp_command(&parts))
+        }
+        Command::SetNx(k, v) => match response {
+            Value::Integer(1) => Some(resp_command(&["SET", k, v])),
+            _ => None,
+        },
+        Command::SetEx(k, secs, v) => {
+            let px = secs.saturating_mul(1000).to_string();
+            Some(resp_command(&["SET", k, v, "PX", &px]))
+        }
+        Command::PSetEx(k, ms, v) => {
+            let ms_s = ms.to_string();
+            Some(resp_command(&["SET", k, v, "PX", &ms_s]))
+        }
+        Command::GetSet(k, v) => Some(resp_command(&["SET", k, v])),
+        Command::Incr(k) | Command::Decr(k) => match response {
+            Value::Integer(n) => {
+                let s = n.to_string();
+                Some(resp_command(&["SET", k, &s]))
+            }
+            _ => None,
+        },
+        Command::IncrBy(k, _) | Command::DecrBy(k, _) => match response {
+            Value::Integer(n) => {
+                let s = n.to_string();
+                Some(resp_command(&["SET", k, &s]))
+            }
+            _ => None,
+        },
+        Command::Expire(k, secs) => match response {
+            Value::Integer(1) => {
+                let ms = secs.saturating_mul(1000).to_string();
+                Some(resp_command(&["PEXPIRE", k, &ms]))
+            }
+            _ => None,
+        },
+        Command::PExpire(k, ms) => match response {
+            Value::Integer(1) => {
+                let ms_s = ms.to_string();
+                Some(resp_command(&["PEXPIRE", k, &ms_s]))
+            }
+            _ => None,
+        },
+        Command::ExpireAt(k, ts) => match response {
+            Value::Integer(1) => {
+                let ts_ms = ts.saturating_mul(1000).to_string();
+                Some(resp_command(&["PEXPIREAT", k, &ts_ms]))
+            }
+            _ => None,
+        },
+        Command::PExpireAt(k, ts) => match response {
+            Value::Integer(1) => {
+                let ts_s = ts.to_string();
+                Some(resp_command(&["PEXPIREAT", k, &ts_s]))
+            }
+            _ => None,
+        },
+        Command::Persist(k) => match response {
+            Value::Integer(1) => Some(resp_command(&["PERSIST", k])),
+            _ => None,
+        },
+        Command::FlushDb => Some(resp_command(&["FLUSHDB"])),
+        Command::Rename(src, dst) => match response {
+            Value::Error(_) => None,
+            _ => Some(resp_command(&["RENAME", src, dst])),
+        },
+        _ => None,
+    }
 }
 
 /// Handles an AUTH attempt. Returns `(disconnect, resp_bytes)`.
@@ -92,22 +207,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── IP allowlist ──────────────────────────────────────────────────────
-    let allowed_ips: Option<Arc<Vec<IpAddr>>> = std::env::var("RECACHED_ALLOW_IPS").ok().map(|s| {
-        let ips: Vec<IpAddr> = s
-            .split(',')
-            .filter_map(|raw| {
-                let trimmed = raw.trim();
-                match IpAddr::from_str(trimmed) {
-                    Ok(ip) => Some(ip),
-                    Err(_) => {
-                        warn!("RECACHED_ALLOW_IPS: ignoring invalid entry '{}'", trimmed);
-                        None
+    let allowed_ips: Option<Arc<Vec<IpAddr>>> =
+        std::env::var("RECACHED_ALLOW_IPS").ok().map(|s| {
+            let ips: Vec<IpAddr> = s
+                .split(',')
+                .filter_map(|raw| {
+                    let trimmed = raw.trim();
+                    match IpAddr::from_str(trimmed) {
+                        Ok(ip) => Some(ip),
+                        Err(_) => {
+                            warn!("RECACHED_ALLOW_IPS: ignoring invalid entry '{}'", trimmed);
+                            None
+                        }
                     }
-                }
-            })
-            .collect();
-        Arc::new(ips)
-    });
+                })
+                .collect();
+            Arc::new(ips)
+        });
 
     if let Some(ips) = &allowed_ips {
         info!("IP allowlist ENABLED: {:?}", ips);
@@ -127,6 +243,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => KeyValueStore::new(),
     });
+
+    // ── background eviction ───────────────────────────────────────────────
+    {
+        let store_sweep = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                EVICTION_INTERVAL_SECS,
+            ));
+            loop {
+                interval.tick().await;
+                store_sweep.sweep_expired();
+            }
+        });
+    }
 
     // ── broadcast channel ─────────────────────────────────────────────────
     // Carries (sender_conn_id, resp_encoded_mutation). WS receivers skip their own messages.
@@ -223,11 +353,10 @@ async fn handle_tcp(
 
     loop {
         match socket.read(&mut read_buf).await {
-            Ok(0) => break, // clean disconnect
+            Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&read_buf[..n]);
 
-                // Drain all complete RESP messages from the buffer.
                 loop {
                     match Value::parse(&buf) {
                         Ok((value, consumed)) => {
@@ -244,7 +373,6 @@ async fn handle_tcp(
                                 }
                             };
 
-                            // Auth interceptor
                             if let Command::Auth(ref pwd) = cmd {
                                 let (disconnect, resp) = process_auth(
                                     pwd,
@@ -271,33 +399,20 @@ async fn handle_tcp(
                                 continue;
                             }
 
-                            // Build RESP-encoded broadcast message before executing.
-                            let broadcast_msg = match &cmd {
-                                Command::Set(k, v) => Some(resp_command(&["SET", k, v])),
-                                Command::Del(keys) => {
-                                    let mut parts = vec!["DEL"];
-                                    let key_refs: Vec<&str> =
-                                        keys.iter().map(|s| s.as_str()).collect();
-                                    parts.extend_from_slice(&key_refs);
-                                    Some(resp_command(&parts))
-                                }
-                                _ => None,
-                            };
+                            let response = store.execute(cmd.clone());
 
-                            // Broadcast first so peers are notified before local state advances.
-                            if let Some(ref msg) = broadcast_msg
-                                && let Err(e) = tx.send((0, msg.clone()))
-                            {
-                                debug!("TCP broadcast had no WS receivers: {}", e);
+                            if let Some(msg) = broadcast_for(&cmd, &response) {
+                                if let Err(e) = tx.send((0, msg)) {
+                                    debug!("TCP broadcast had no WS receivers: {}", e);
+                                }
                             }
 
-                            let response = store.execute(cmd);
                             if let Err(e) = socket.write_all(&response.serialize()).await {
                                 warn!("TCP write error: {}", e);
                                 return;
                             }
                         }
-                        Err(ref e) if e == "Incomplete" => break, // need more bytes
+                        Err(ref e) if e == "Incomplete" => break,
                         Err(e) => {
                             warn!("TCP protocol error: {}", e);
                             if let Err(we) = socket.write_all(b"-ERR Protocol error\r\n").await {
@@ -403,25 +518,14 @@ async fn handle_ws(
                             continue;
                         }
 
-                        // Re-encode the validated mutation as the canonical broadcast payload.
-                        let broadcast_msg = match &cmd {
-                            Command::Set(k, v) => Some(resp_command(&["SET", k, v])),
-                            Command::Del(keys) => {
-                                let mut parts = vec!["DEL"];
-                                let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                                parts.extend_from_slice(&key_refs);
-                                Some(resp_command(&parts))
-                            }
-                            _ => None,
-                        };
+                        let response = store.execute(cmd.clone());
 
-                        if let Some(ref b_msg) = broadcast_msg
-                            && let Err(e) = tx.send((conn_id, b_msg.clone()))
-                        {
-                            debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
+                        if let Some(b_msg) = broadcast_for(&cmd, &response) {
+                            if let Err(e) = tx.send((conn_id, b_msg)) {
+                                debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
+                            }
                         }
 
-                        let response = store.execute(cmd);
                         if let Err(e) = ws_sender.send(Message::Text(
                             String::from_utf8_lossy(&response.serialize()).into_owned().into(),
                         )).await {
@@ -429,7 +533,7 @@ async fn handle_ws(
                             break;
                         }
                     }
-                    Some(Ok(_)) => {} // Ping / Pong / Close handled by tungstenite
+                    Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         warn!("WS error on conn {}: {}", conn_id, e);
                         break;
@@ -445,7 +549,7 @@ async fn handle_ws(
                             break;
                         }
                     }
-                    Ok(_) => {} // own message — skip to avoid double-apply in wasm-edge
+                    Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!("WS conn {} lagged, missed {} messages, resubscribing", conn_id, n);
                         rx = tx.subscribe();
