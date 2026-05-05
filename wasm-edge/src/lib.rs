@@ -50,8 +50,9 @@ impl RecachedCache {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
                 let s = String::from(text);
                 if let Ok((value, _)) = Value::parse(s.as_bytes())
-                    && let Ok(cmd) = Command::from_value(value) {
-                        match cmd {
+                    && let Ok(cmd) = Command::from_value(value)
+                {
+                    match cmd {
                             // Strings + expiry
                             Command::Set(_, _, _)
                             | Command::Del(_)
@@ -91,7 +92,7 @@ impl RecachedCache {
                             }
                             _ => {}
                         }
-                    }
+                }
             }
         }) as Box<dyn FnMut(MessageEvent)>);
 
@@ -106,9 +107,10 @@ impl RecachedCache {
     /// Send an AUTH command to the server. The response arrives asynchronously via onmessage.
     pub fn auth(&self, password: &str) -> String {
         if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN {
-                let _ = ws.send_with_str(&to_resp(&["AUTH", password]));
-            }
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            let _ = ws.send_with_str(&to_resp(&["AUTH", password]));
+        }
         "OK".to_string()
     }
 
@@ -121,9 +123,10 @@ impl RecachedCache {
         ));
 
         if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN {
-                let _ = ws.send_with_str(&to_resp(&["SET", key, value]));
-            }
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            let _ = ws.send_with_str(&to_resp(&["SET", key, value]));
+        }
 
         match resp {
             Value::SimpleString(s) => s,
@@ -143,10 +146,10 @@ impl RecachedCache {
             .execute(Command::Set(key.to_string(), value.to_string(), opts));
 
         if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN {
-                let _ =
-                    ws.send_with_str(&to_resp(&["SET", key, value, "EX", &seconds.to_string()]));
-            }
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            let _ = ws.send_with_str(&to_resp(&["SET", key, value, "EX", &seconds.to_string()]));
+        }
 
         match resp {
             Value::SimpleString(s) => s,
@@ -168,9 +171,10 @@ impl RecachedCache {
         let resp = self.store.execute(Command::Del(vec![key.to_string()]));
 
         if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN {
-                let _ = ws.send_with_str(&to_resp(&["DEL", key]));
-            }
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            let _ = ws.send_with_str(&to_resp(&["DEL", key]));
+        }
 
         match resp {
             Value::Integer(i) => i as i32,
@@ -192,5 +196,35 @@ impl RecachedCache {
             self.store.execute(Command::Exists(vec![key.to_string()])),
             Value::Integer(1)
         )
+    }
+
+    /// Publish a message to a channel on the server.
+    /// Returns the number of subscribers that received the message (as reported by the server).
+    /// The response is asynchronous — the return value here is always 0 since the
+    /// actual subscriber count arrives via the WebSocket response frame, not this call.
+    pub fn publish(&self, channel: &str, message: &str) {
+        if let Some(ws) = &self.ws
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            let _ = ws.send_with_str(&to_resp(&["PUBLISH", channel, message]));
+        }
+    }
+
+    /// Subscribe to a channel on the server. Push messages arrive via the `onmessage` callback.
+    pub fn subscribe(&self, channel: &str) {
+        if let Some(ws) = &self.ws
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            let _ = ws.send_with_str(&to_resp(&["SUBSCRIBE", channel]));
+        }
+    }
+
+    /// Unsubscribe from a channel on the server.
+    pub fn unsubscribe(&self, channel: &str) {
+        if let Some(ws) = &self.ws
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            let _ = ws.send_with_str(&to_resp(&["UNSUBSCRIBE", channel]));
+        }
     }
 }

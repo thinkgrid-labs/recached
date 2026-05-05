@@ -134,6 +134,16 @@ pub enum Command {
     ZCard(String),
     ZIncrBy(String, f64, String),
     ZCount(String, String, String),
+    // ── Transactions ─────────────────────────────────────────────────────────
+    Multi,
+    Exec,
+    Discard,
+    // ── Pub/Sub ───────────────────────────────────────────────────────────────
+    Subscribe(Vec<String>),
+    Unsubscribe(Vec<String>),
+    PSubscribe(Vec<String>),
+    PUnsubscribe(Vec<String>),
+    Publish(String, String),
     Unknown(String),
 }
 
@@ -910,6 +920,38 @@ impl Command {
                         ))
                     }
 
+                    // ── Transactions ─────────────────────────────────────
+                    "MULTI" => Ok(Command::Multi),
+                    "EXEC" => Ok(Command::Exec),
+                    "DISCARD" => Ok(Command::Discard),
+
+                    // ── Pub/Sub ───────────────────────────────────────────
+                    "SUBSCRIBE" => {
+                        need!(2);
+                        Ok(Command::Subscribe(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
+                    }
+                    "UNSUBSCRIBE" => Ok(Command::Unsubscribe(
+                        arr[1..].iter().filter_map(extract_string).collect(),
+                    )),
+                    "PSUBSCRIBE" => {
+                        need!(2);
+                        Ok(Command::PSubscribe(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
+                    }
+                    "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe(
+                        arr[1..].iter().filter_map(extract_string).collect(),
+                    )),
+                    "PUBLISH" => {
+                        need!(3);
+                        Ok(Command::Publish(
+                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+
                     _ => Ok(Command::Unknown(cmd_name.to_owned())),
                 }
             }
@@ -1206,5 +1248,52 @@ mod tests {
     #[test]
     fn non_array_input() {
         assert!(Command::from_value(Value::SimpleString("PING".into())).is_err());
+    }
+
+    // ── Phase 4: Transactions ─────────────────────────────────────────────
+    #[test]
+    fn multi_exec_discard_parse() {
+        assert_eq!(
+            Command::from_value(array(&["MULTI"])).unwrap(),
+            Command::Multi
+        );
+        assert_eq!(
+            Command::from_value(array(&["EXEC"])).unwrap(),
+            Command::Exec
+        );
+        assert_eq!(
+            Command::from_value(array(&["DISCARD"])).unwrap(),
+            Command::Discard
+        );
+    }
+
+    // ── Phase 4: Pub/Sub ──────────────────────────────────────────────────
+    #[test]
+    fn subscribe_parse() {
+        let cmd = Command::from_value(array(&["SUBSCRIBE", "ch1", "ch2"])).unwrap();
+        assert_eq!(cmd, Command::Subscribe(vec!["ch1".into(), "ch2".into()]));
+    }
+    #[test]
+    fn subscribe_requires_channel() {
+        assert!(Command::from_value(array(&["SUBSCRIBE"])).is_err());
+    }
+    #[test]
+    fn unsubscribe_no_args() {
+        let cmd = Command::from_value(array(&["UNSUBSCRIBE"])).unwrap();
+        assert_eq!(cmd, Command::Unsubscribe(vec![]));
+    }
+    #[test]
+    fn psubscribe_parse() {
+        let cmd = Command::from_value(array(&["PSUBSCRIBE", "news.*"])).unwrap();
+        assert_eq!(cmd, Command::PSubscribe(vec!["news.*".into()]));
+    }
+    #[test]
+    fn publish_parse() {
+        let cmd = Command::from_value(array(&["PUBLISH", "chan", "hello"])).unwrap();
+        assert_eq!(cmd, Command::Publish("chan".into(), "hello".into()));
+    }
+    #[test]
+    fn publish_requires_args() {
+        assert!(Command::from_value(array(&["PUBLISH", "chan"])).is_err());
     }
 }

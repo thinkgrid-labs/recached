@@ -1677,6 +1677,21 @@ impl KeyValueStore {
                 Ok(Value::Integer(count as i64))
             }),
 
+            // ── Transactions ─────────────────────────────────────────────────
+            // These are handled at the server layer before reaching the store.
+            // The arms below are fallback-only (e.g. store used in tests).
+            Command::Multi => Value::SimpleString("OK".to_string()),
+            Command::Exec => Value::Error("ERR EXEC without MULTI".to_string()),
+            Command::Discard => Value::Error("ERR DISCARD without MULTI".to_string()),
+
+            // ── Pub/Sub ───────────────────────────────────────────────────────
+            // Routing is handled entirely in the server layer.
+            Command::Subscribe(_)
+            | Command::Unsubscribe(_)
+            | Command::PSubscribe(_)
+            | Command::PUnsubscribe(_) => Value::Error("ERR only in pub/sub context".to_string()),
+            Command::Publish(_, _) => Value::Integer(0),
+
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
         }
     }
@@ -1970,10 +1985,11 @@ fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>)
             }
             Some(ZAddCondition::Xx) => {
                 if let Some(s) = zset.scores.get_mut(&member)
-                    && (*s - score).abs() > f64::EPSILON {
-                        *s = score;
-                        changed += 1;
-                    }
+                    && (*s - score).abs() > f64::EPSILON
+                {
+                    *s = score;
+                    changed += 1;
+                }
             }
             None => {
                 let old = zset.scores.insert(member, score);
@@ -2483,5 +2499,38 @@ mod tests {
         s.execute(Command::PExpire("h".into(), 0));
         // Now lazy-expired
         assert_eq!(s.execute(Command::HGet("h".into(), "f".into())), nil());
+    }
+
+    // ── Transactions (store-layer stubs) ──────────────────────────────────────
+
+    #[test]
+    fn multi_returns_ok_stub() {
+        // Store-layer stub: server intercepts MULTI before execute(), but the
+        // stub must return OK so the exhaustiveness arm is exercised here.
+        let s = store();
+        assert_eq!(s.execute(Command::Multi), ok());
+    }
+
+    #[test]
+    fn exec_without_multi_error() {
+        let s = store();
+        let res = s.execute(Command::Exec);
+        assert!(matches!(res, Value::Error(e) if e.contains("EXEC without MULTI")));
+    }
+
+    #[test]
+    fn discard_without_multi_error() {
+        let s = store();
+        let res = s.execute(Command::Discard);
+        assert!(matches!(res, Value::Error(e) if e.contains("DISCARD without MULTI")));
+    }
+
+    #[test]
+    fn publish_stub_returns_zero() {
+        let s = store();
+        assert_eq!(
+            s.execute(Command::Publish("ch".into(), "msg".into())),
+            int(0)
+        );
     }
 }

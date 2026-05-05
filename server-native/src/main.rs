@@ -1,14 +1,15 @@
-use core_engine::cmd::{Command, SetExpiry};
+use core_engine::cmd::{Command, SetExpiry, ZAddCondition};
 use core_engine::resp::Value;
 use core_engine::store::KeyValueStore;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
@@ -23,14 +24,165 @@ const EVICTION_INTERVAL_SECS: u64 = 1;
 
 // ── connection identity ──────────────────────────────────────────────────────
 
-// TCP clients broadcast with id=0; WS clients get ids ≥ 1.
+// TCP mutation broadcasts use id=0; WS/TCP pubsub connections get ids ≥ 1.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_conn_id() -> u64 {
     NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+// ── pub/sub ───────────────────────────────────────────────────────────────────
+
+enum PubSubMsg {
+    Message {
+        channel: String,
+        message: String,
+    },
+    PMessage {
+        pattern: String,
+        channel: String,
+        message: String,
+    },
+}
+
+type PubSubSender = mpsc::UnboundedSender<PubSubMsg>;
+
+struct PubSubHub {
+    channel_subs: HashMap<String, Vec<(u64, PubSubSender)>>,
+    pattern_subs: Vec<(String, u64, PubSubSender)>,
+}
+
+impl PubSubHub {
+    fn new() -> Self {
+        Self {
+            channel_subs: HashMap::new(),
+            pattern_subs: Vec::new(),
+        }
+    }
+
+    fn subscribe(&mut self, conn_id: u64, channel: &str, tx: PubSubSender) {
+        self.channel_subs
+            .entry(channel.to_string())
+            .or_default()
+            .push((conn_id, tx));
+    }
+
+    fn psubscribe(&mut self, conn_id: u64, pattern: &str, tx: PubSubSender) {
+        self.pattern_subs.push((pattern.to_string(), conn_id, tx));
+    }
+
+    fn unsubscribe(&mut self, conn_id: u64, channel: &str) {
+        if let Some(v) = self.channel_subs.get_mut(channel) {
+            v.retain(|(id, _)| *id != conn_id);
+        }
+    }
+
+    fn punsubscribe(&mut self, conn_id: u64, pattern: &str) {
+        self.pattern_subs
+            .retain(|(p, id, _)| !(p == pattern && *id == conn_id));
+    }
+
+    fn unsubscribe_all(&mut self, conn_id: u64) {
+        for v in self.channel_subs.values_mut() {
+            v.retain(|(id, _)| *id != conn_id);
+        }
+        self.pattern_subs.retain(|(_, id, _)| *id != conn_id);
+    }
+
+    /// Deliver to all matching subscribers; returns the count delivered.
+    fn publish(&mut self, channel: &str, message: &str) -> i64 {
+        let mut count = 0i64;
+
+        if let Some(subs) = self.channel_subs.get_mut(channel) {
+            subs.retain(|(_, tx)| {
+                let ok = tx
+                    .send(PubSubMsg::Message {
+                        channel: channel.to_string(),
+                        message: message.to_string(),
+                    })
+                    .is_ok();
+                if ok {
+                    count += 1;
+                }
+                ok
+            });
+        }
+
+        let pattern_txs: Vec<(String, PubSubSender)> = self
+            .pattern_subs
+            .iter()
+            .filter(|(p, _, _)| glob_match(p, channel))
+            .map(|(p, _, tx)| (p.clone(), tx.clone()))
+            .collect();
+        for (pattern, tx) in pattern_txs {
+            if tx
+                .send(PubSubMsg::PMessage {
+                    pattern,
+                    channel: channel.to_string(),
+                    message: message.to_string(),
+                })
+                .is_ok()
+            {
+                count += 1;
+            }
+        }
+        self.pattern_subs.retain(|(_, _, tx)| !tx.is_closed());
+        count
+    }
+}
+
+type SharedPubSub = Arc<Mutex<PubSubHub>>;
+
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+fn encode_pubsub_msg(msg: PubSubMsg) -> Vec<u8> {
+    match msg {
+        PubSubMsg::Message { channel, message } => Value::Array(Some(vec![
+            Value::BulkString(Some(b"message".to_vec())),
+            Value::BulkString(Some(channel.into_bytes())),
+            Value::BulkString(Some(message.into_bytes())),
+        ]))
+        .serialize(),
+        PubSubMsg::PMessage {
+            pattern,
+            channel,
+            message,
+        } => Value::Array(Some(vec![
+            Value::BulkString(Some(b"pmessage".to_vec())),
+            Value::BulkString(Some(pattern.into_bytes())),
+            Value::BulkString(Some(channel.into_bytes())),
+            Value::BulkString(Some(message.into_bytes())),
+        ]))
+        .serialize(),
+    }
+}
+
+fn resp_subscribe_ack(kind: &str, channel: &str, count: usize) -> Vec<u8> {
+    Value::Array(Some(vec![
+        Value::BulkString(Some(kind.as_bytes().to_vec())),
+        Value::BulkString(Some(channel.as_bytes().to_vec())),
+        Value::Integer(count as i64),
+    ]))
+    .serialize()
+}
+
+fn glob_match(pattern: &str, s: &str) -> bool {
+    glob_helper(pattern.as_bytes(), s.as_bytes())
+}
+
+fn glob_helper(pat: &[u8], s: &[u8]) -> bool {
+    match (pat.first(), s.first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(b'*'), _) => {
+            glob_helper(&pat[1..], s) || (!s.is_empty() && glob_helper(pat, &s[1..]))
+        }
+        (Some(b'?'), Some(_)) => glob_helper(&pat[1..], &s[1..]),
+        (Some(b'?'), None) | (Some(_), None) => false,
+        (Some(p), Some(c)) if p == c => glob_helper(&pat[1..], &s[1..]),
+        _ => false,
+    }
+}
 
 /// Encodes a list of string parts as a RESP bulk-string array.
 fn resp_command(parts: &[&str]) -> String {
@@ -280,7 +432,6 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             _ => None,
         },
         Command::SPop(k, count) => {
-            // Extract popped members from response and broadcast as SREM
             let popped: Vec<String> = match response {
                 Value::BulkString(Some(data)) => {
                     vec![String::from_utf8_lossy(data).into_owned()]
@@ -332,7 +483,6 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
 
         // ── Sorted Set ────────────────────────────────────────────────────────
         Command::ZAdd(k, opts, pairs) => {
-            use core_engine::cmd::ZAddCondition;
             let mut parts: Vec<String> = vec!["ZADD".into(), k.clone()];
             if let Some(cond) = &opts.condition {
                 parts.push(match cond {
@@ -367,6 +517,7 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             Some(resp_command(&["ZINCRBY", k, &delta_s, member]))
         }
 
+        // Pub/Sub and transactions carry no store state — no broadcast needed.
         _ => None,
     }
 }
@@ -484,9 +635,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // ── broadcast channel ─────────────────────────────────────────────────
+    // ── broadcast channel (mutation sync) ────────────────────────────────
     // Carries (sender_conn_id, resp_encoded_mutation). WS receivers skip their own messages.
     let (tx, _rx) = broadcast::channel::<(u64, String)>(BROADCAST_CHANNEL_CAPACITY);
+
+    // ── pub/sub hub ───────────────────────────────────────────────────────
+    let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
 
     // ── connection limiter ────────────────────────────────────────────────
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -503,6 +657,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pass_tcp = Arc::clone(&global_password);
     let allowed_tcp = allowed_ips.clone();
     let sem_tcp = Arc::clone(&semaphore);
+    let pubsub_tcp = Arc::clone(&pubsub);
 
     tokio::spawn(async move {
         loop {
@@ -524,9 +679,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let s = Arc::clone(&store_tcp);
                     let t = tx_tcp.clone();
                     let p = Arc::clone(&pass_tcp);
+                    let ps = Arc::clone(&pubsub_tcp);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        handle_tcp(socket, s, t, p).await;
+                        handle_tcp(socket, s, t, p, ps).await;
                     });
                 }
                 Err(e) => warn!("TCP accept error: {}", e),
@@ -553,10 +709,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let s = Arc::clone(&store);
                 let t = tx.clone();
                 let p = Arc::clone(&global_password);
+                let ps = Arc::clone(&pubsub);
                 let id = next_conn_id();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    handle_ws(socket, s, t, p, id).await;
+                    handle_ws(socket, s, t, p, id, ps).await;
                 });
             }
             Err(e) => warn!("WS accept error: {}", e),
@@ -567,93 +724,235 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ── TCP handler ───────────────────────────────────────────────────────────────
 
 async fn handle_tcp(
-    mut socket: TcpStream,
+    socket: TcpStream,
     store: Arc<KeyValueStore>,
     tx: broadcast::Sender<(u64, String)>,
     password: Arc<Option<String>>,
+    pubsub: SharedPubSub,
 ) {
+    let (mut reader, mut writer) = socket.into_split();
     let mut buf = Vec::<u8>::new();
     let mut read_buf = [0u8; TCP_READ_BUFFER_BYTES];
     let mut is_authenticated = password.is_none();
     let mut auth_failures: u32 = 0;
+    let mut multi_queue: Option<Vec<Command>> = None;
+    let mut subscribed_channels: HashSet<String> = HashSet::new();
+    let mut subscribed_patterns: HashSet<String> = HashSet::new();
+    let (ps_tx, mut ps_rx) = mpsc::unbounded_channel::<PubSubMsg>();
+    let conn_id = next_conn_id();
 
-    loop {
-        match socket.read(&mut read_buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&read_buf[..n]);
+    'outer: loop {
+        let is_subscribed = !subscribed_channels.is_empty() || !subscribed_patterns.is_empty();
 
-                loop {
-                    match Value::parse(&buf) {
-                        Ok((value, consumed)) => {
-                            buf.drain(..consumed);
+        tokio::select! {
+            result = reader.read(&mut read_buf) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&read_buf[..n]);
+                        'parse: loop {
+                            match Value::parse(&buf) {
+                                Ok((value, consumed)) => {
+                                    buf.drain(..consumed);
+                                    let cmd = match Command::from_value(value) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            let r = Value::Error(e).serialize();
+                                            if writer.write_all(&r).await.is_err() { break 'outer; }
+                                            continue 'parse;
+                                        }
+                                    };
 
-                            let cmd = match Command::from_value(value) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    let resp = Value::Error(e).serialize();
-                                    if let Err(we) = socket.write_all(&resp).await {
-                                        warn!("TCP write error: {}", we);
+                                    // AUTH is always processed immediately
+                                    if let Command::Auth(ref pwd) = cmd {
+                                        let (disconnect, resp) = process_auth(
+                                            pwd, &password, &mut is_authenticated, &mut auth_failures,
+                                        );
+                                        if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                        if disconnect { break 'outer; }
+                                        continue 'parse;
                                     }
-                                    continue;
-                                }
-                            };
 
-                            if let Command::Auth(ref pwd) = cmd {
-                                let (disconnect, resp) = process_auth(
-                                    pwd,
-                                    &password,
-                                    &mut is_authenticated,
-                                    &mut auth_failures,
-                                );
-                                if let Err(e) = socket.write_all(&resp).await {
-                                    warn!("TCP write error: {}", e);
-                                }
-                                if disconnect {
-                                    return;
-                                }
-                                continue;
-                            }
+                                    if !is_authenticated {
+                                        if writer.write_all(b"-NOAUTH Authentication required.\r\n").await.is_err() {
+                                            break 'outer;
+                                        }
+                                        continue 'parse;
+                                    }
 
-                            if !is_authenticated {
-                                if let Err(e) = socket
-                                    .write_all(b"-NOAUTH Authentication required.\r\n")
-                                    .await
-                                {
-                                    warn!("TCP write error: {}", e);
+                                    // ── Transactions ──────────────────────────────
+                                    match &cmd {
+                                        Command::Multi => {
+                                            let resp = if multi_queue.is_some() {
+                                                b"-ERR MULTI calls can not be nested\r\n".to_vec()
+                                            } else {
+                                                multi_queue = Some(Vec::new());
+                                                b"+OK\r\n".to_vec()
+                                            };
+                                            if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                            continue 'parse;
+                                        }
+                                        Command::Discard => {
+                                            let resp = if multi_queue.take().is_some() {
+                                                b"+OK\r\n".to_vec()
+                                            } else {
+                                                b"-ERR DISCARD without MULTI\r\n".to_vec()
+                                            };
+                                            if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                            continue 'parse;
+                                        }
+                                        Command::Exec => {
+                                            match multi_queue.take() {
+                                                None => {
+                                                    if writer.write_all(b"-ERR EXEC without MULTI\r\n").await.is_err() { break 'outer; }
+                                                }
+                                                Some(queue) => {
+                                                    let mut results = Vec::with_capacity(queue.len());
+                                                    for qcmd in queue {
+                                                        let resp = store.execute(qcmd.clone());
+                                                        if let Some(msg) = broadcast_for(&qcmd, &resp) {
+                                                            let _ = tx.send((0, msg));
+                                                        }
+                                                        results.push(resp);
+                                                    }
+                                                    let out = Value::Array(Some(results)).serialize();
+                                                    if writer.write_all(&out).await.is_err() { break 'outer; }
+                                                }
+                                            }
+                                            continue 'parse;
+                                        }
+                                        _ => {}
+                                    }
+
+                                    // If inside MULTI, queue the command
+                                    if let Some(ref mut queue) = multi_queue {
+                                        // Pub/sub commands cannot be queued
+                                        match &cmd {
+                                            Command::Subscribe(_) | Command::Unsubscribe(_)
+                                            | Command::PSubscribe(_) | Command::PUnsubscribe(_)
+                                            | Command::Publish(_, _) => {
+                                                let err = b"-ERR Command not allowed inside a transaction\r\n";
+                                                if writer.write_all(err).await.is_err() { break 'outer; }
+                                            }
+                                            _ => {
+                                                queue.push(cmd);
+                                                if writer.write_all(b"+QUEUED\r\n").await.is_err() { break 'outer; }
+                                            }
+                                        }
+                                        continue 'parse;
+                                    }
+
+                                    // ── Pub/Sub commands ──────────────────────────
+                                    match cmd {
+                                        Command::Subscribe(channels) => {
+                                            for ch in channels {
+                                                subscribed_channels.insert(ch.clone());
+                                                pubsub.lock().unwrap().subscribe(conn_id, &ch, ps_tx.clone());
+                                                let count = subscribed_channels.len() + subscribed_patterns.len();
+                                                let ack = resp_subscribe_ack("subscribe", &ch, count);
+                                                if writer.write_all(&ack).await.is_err() { break 'outer; }
+                                            }
+                                        }
+                                        Command::Unsubscribe(channels) => {
+                                            let targets: Vec<String> = if channels.is_empty() {
+                                                subscribed_channels.drain().collect()
+                                            } else {
+                                                channels.into_iter().filter(|c| subscribed_channels.remove(c)).collect()
+                                            };
+                                            for ch in &targets {
+                                                pubsub.lock().unwrap().unsubscribe(conn_id, ch);
+                                                let count = subscribed_channels.len() + subscribed_patterns.len();
+                                                let ack = resp_subscribe_ack("unsubscribe", ch, count);
+                                                if writer.write_all(&ack).await.is_err() { break 'outer; }
+                                            }
+                                            if targets.is_empty() {
+                                                let ack = resp_subscribe_ack("unsubscribe", "", 0);
+                                                if writer.write_all(&ack).await.is_err() { break 'outer; }
+                                            }
+                                        }
+                                        Command::PSubscribe(patterns) => {
+                                            for pat in patterns {
+                                                subscribed_patterns.insert(pat.clone());
+                                                pubsub.lock().unwrap().psubscribe(conn_id, &pat, ps_tx.clone());
+                                                let count = subscribed_channels.len() + subscribed_patterns.len();
+                                                let ack = resp_subscribe_ack("psubscribe", &pat, count);
+                                                if writer.write_all(&ack).await.is_err() { break 'outer; }
+                                            }
+                                        }
+                                        Command::PUnsubscribe(patterns) => {
+                                            let targets: Vec<String> = if patterns.is_empty() {
+                                                subscribed_patterns.drain().collect()
+                                            } else {
+                                                patterns.into_iter().filter(|p| subscribed_patterns.remove(p)).collect()
+                                            };
+                                            for pat in &targets {
+                                                pubsub.lock().unwrap().punsubscribe(conn_id, pat);
+                                                let count = subscribed_channels.len() + subscribed_patterns.len();
+                                                let ack = resp_subscribe_ack("punsubscribe", pat, count);
+                                                if writer.write_all(&ack).await.is_err() { break 'outer; }
+                                            }
+                                            if targets.is_empty() {
+                                                let ack = resp_subscribe_ack("punsubscribe", "", 0);
+                                                if writer.write_all(&ack).await.is_err() { break 'outer; }
+                                            }
+                                        }
+                                        Command::Publish(channel, message) => {
+                                            let count = pubsub.lock().unwrap().publish(&channel, &message);
+                                            let resp = Value::Integer(count).serialize();
+                                            if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                        }
+
+                                        cmd => {
+                                            // In subscribe mode only ping is allowed
+                                            if is_subscribed && !matches!(cmd, Command::Ping(_)) {
+                                                let err = b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in subscribe mode\r\n";
+                                                if writer.write_all(err).await.is_err() { break 'outer; }
+                                                continue 'parse;
+                                            }
+                                            let response = store.execute(cmd.clone());
+                                            if let Some(msg) = broadcast_for(&cmd, &response)
+                                                && let Err(e) = tx.send((0, msg))
+                                            {
+                                                debug!("TCP broadcast had no WS receivers: {}", e);
+                                            }
+                                            if writer.write_all(&response.serialize()).await.is_err() {
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
                                 }
-                                continue;
-                            }
-
-                            let response = store.execute(cmd.clone());
-
-                            if let Some(msg) = broadcast_for(&cmd, &response)
-                                && let Err(e) = tx.send((0, msg)) {
-                                    debug!("TCP broadcast had no WS receivers: {}", e);
+                                Err(ref e) if e == "Incomplete" => break 'parse,
+                                Err(e) => {
+                                    warn!("TCP protocol error: {}", e);
+                                    let _ = writer.write_all(b"-ERR Protocol error\r\n").await;
+                                    buf.clear();
+                                    break 'parse;
                                 }
-
-                            if let Err(e) = socket.write_all(&response.serialize()).await {
-                                warn!("TCP write error: {}", e);
-                                return;
                             }
                         }
-                        Err(ref e) if e == "Incomplete" => break,
-                        Err(e) => {
-                            warn!("TCP protocol error: {}", e);
-                            if let Err(we) = socket.write_all(b"-ERR Protocol error\r\n").await {
-                                warn!("TCP write error: {}", we);
-                            }
-                            buf.clear();
-                            break;
-                        }
+                    }
+                    Err(e) => {
+                        warn!("TCP read error: {}", e);
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                warn!("TCP read error: {}", e);
-                break;
+
+            msg = ps_rx.recv(), if is_subscribed => {
+                match msg {
+                    Some(m) => {
+                        if writer.write_all(&encode_pubsub_msg(m)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
             }
         }
+    }
+
+    if !subscribed_channels.is_empty() || !subscribed_patterns.is_empty() {
+        pubsub.lock().unwrap().unsubscribe_all(conn_id);
     }
 }
 
@@ -665,6 +964,7 @@ async fn handle_ws(
     tx: broadcast::Sender<(u64, String)>,
     password: Arc<Option<String>>,
     conn_id: u64,
+    pubsub: SharedPubSub,
 ) {
     let ws_stream = match accept_async(socket).await {
         Ok(ws) => ws,
@@ -678,8 +978,23 @@ async fn handle_ws(
     let mut rx = tx.subscribe();
     let mut is_authenticated = password.is_none();
     let mut auth_failures: u32 = 0;
+    let mut multi_queue: Option<Vec<Command>> = None;
+    let mut subscribed_channels: HashSet<String> = HashSet::new();
+    let mut subscribed_patterns: HashSet<String> = HashSet::new();
+    let (ps_tx, mut ps_rx) = mpsc::unbounded_channel::<PubSubMsg>();
 
-    loop {
+    macro_rules! ws_send {
+        ($bytes:expr) => {{
+            let text = String::from_utf8_lossy($bytes).into_owned();
+            if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }};
+    }
+
+    'outer: loop {
+        let is_subscribed = !subscribed_channels.is_empty() || !subscribed_patterns.is_empty();
+
         tokio::select! {
             msg = ws_receiver.next() => {
                 match msg {
@@ -687,14 +1002,8 @@ async fn handle_ws(
                         let (value, _) = match Value::parse(text.as_bytes()) {
                             Ok(v) => v,
                             Err(e) => {
-                                warn!("WS RESP parse error on conn {}: {}", conn_id, e);
                                 let err = Value::Error(format!("ERR Protocol error: {}", e)).serialize();
-                                if let Err(we) = ws_sender.send(Message::Text(
-                                    String::from_utf8_lossy(&err).into_owned().into(),
-                                )).await {
-                                    warn!("WS send error on conn {}: {}", conn_id, we);
-                                    break;
-                                }
+                                ws_send!(&err);
                                 continue;
                             }
                         };
@@ -703,58 +1012,153 @@ async fn handle_ws(
                             Ok(c) => c,
                             Err(e) => {
                                 let err = Value::Error(e).serialize();
-                                if let Err(we) = ws_sender.send(Message::Text(
-                                    String::from_utf8_lossy(&err).into_owned().into(),
-                                )).await {
-                                    warn!("WS send error on conn {}: {}", conn_id, we);
-                                    break;
-                                }
+                                ws_send!(&err);
                                 continue;
                             }
                         };
 
+                        // AUTH
                         if let Command::Auth(ref pwd) = cmd {
                             let (disconnect, resp) = process_auth(
-                                pwd,
-                                &password,
-                                &mut is_authenticated,
-                                &mut auth_failures,
+                                pwd, &password, &mut is_authenticated, &mut auth_failures,
                             );
-                            if let Err(e) = ws_sender.send(Message::Text(
-                                String::from_utf8_lossy(&resp).into_owned().into(),
-                            )).await {
-                                warn!("WS send error on conn {}: {}", conn_id, e);
-                                break;
-                            }
-                            if disconnect {
-                                break;
-                            }
+                            ws_send!(&resp);
+                            if disconnect { break; }
                             continue;
                         }
 
                         if !is_authenticated {
                             let resp = Value::Error("NOAUTH Authentication required.".to_string()).serialize();
-                            if let Err(e) = ws_sender.send(Message::Text(
-                                String::from_utf8_lossy(&resp).into_owned().into(),
-                            )).await {
-                                warn!("WS send error on conn {}: {}", conn_id, e);
-                                break;
+                            ws_send!(&resp);
+                            continue;
+                        }
+
+                        // ── Transactions ──────────────────────────────────────
+                        match &cmd {
+                            Command::Multi => {
+                                let resp = if multi_queue.is_some() {
+                                    b"-ERR MULTI calls can not be nested\r\n".to_vec()
+                                } else {
+                                    multi_queue = Some(Vec::new());
+                                    b"+OK\r\n".to_vec()
+                                };
+                                ws_send!(&resp);
+                                continue;
+                            }
+                            Command::Discard => {
+                                let resp = if multi_queue.take().is_some() {
+                                    b"+OK\r\n".to_vec()
+                                } else {
+                                    b"-ERR DISCARD without MULTI\r\n".to_vec()
+                                };
+                                ws_send!(&resp);
+                                continue;
+                            }
+                            Command::Exec => {
+                                match multi_queue.take() {
+                                    None => {
+                                        ws_send!(b"-ERR EXEC without MULTI\r\n");
+                                    }
+                                    Some(queue) => {
+                                        let mut results = Vec::with_capacity(queue.len());
+                                        for qcmd in queue {
+                                            let resp = store.execute(qcmd.clone());
+                                            if let Some(msg) = broadcast_for(&qcmd, &resp) {
+                                                let _ = tx.send((conn_id, msg));
+                                            }
+                                            results.push(resp);
+                                        }
+                                        let out = Value::Array(Some(results)).serialize();
+                                        ws_send!(&out);
+                                    }
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+
+                        // Queue if inside MULTI
+                        if let Some(ref mut queue) = multi_queue {
+                            match &cmd {
+                                Command::Subscribe(_) | Command::Unsubscribe(_)
+                                | Command::PSubscribe(_) | Command::PUnsubscribe(_)
+                                | Command::Publish(_, _) => {
+                                    ws_send!(b"-ERR Command not allowed inside a transaction\r\n");
+                                }
+                                _ => {
+                                    queue.push(cmd);
+                                    ws_send!(b"+QUEUED\r\n");
+                                }
                             }
                             continue;
                         }
 
-                        let response = store.execute(cmd.clone());
-
-                        if let Some(b_msg) = broadcast_for(&cmd, &response)
-                            && let Err(e) = tx.send((conn_id, b_msg)) {
-                                debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
+                        // ── Pub/Sub commands ──────────────────────────────────
+                        match cmd {
+                            Command::Subscribe(channels) => {
+                                for ch in channels {
+                                    subscribed_channels.insert(ch.clone());
+                                    pubsub.lock().unwrap().subscribe(conn_id, &ch, ps_tx.clone());
+                                    let count = subscribed_channels.len() + subscribed_patterns.len();
+                                    ws_send!(&resp_subscribe_ack("subscribe", &ch, count));
+                                }
+                            }
+                            Command::Unsubscribe(channels) => {
+                                let targets: Vec<String> = if channels.is_empty() {
+                                    subscribed_channels.drain().collect()
+                                } else {
+                                    channels.into_iter().filter(|c| subscribed_channels.remove(c)).collect()
+                                };
+                                for ch in &targets {
+                                    pubsub.lock().unwrap().unsubscribe(conn_id, ch);
+                                    let count = subscribed_channels.len() + subscribed_patterns.len();
+                                    ws_send!(&resp_subscribe_ack("unsubscribe", ch, count));
+                                }
+                                if targets.is_empty() {
+                                    ws_send!(&resp_subscribe_ack("unsubscribe", "", 0));
+                                }
+                            }
+                            Command::PSubscribe(patterns) => {
+                                for pat in patterns {
+                                    subscribed_patterns.insert(pat.clone());
+                                    pubsub.lock().unwrap().psubscribe(conn_id, &pat, ps_tx.clone());
+                                    let count = subscribed_channels.len() + subscribed_patterns.len();
+                                    ws_send!(&resp_subscribe_ack("psubscribe", &pat, count));
+                                }
+                            }
+                            Command::PUnsubscribe(patterns) => {
+                                let targets: Vec<String> = if patterns.is_empty() {
+                                    subscribed_patterns.drain().collect()
+                                } else {
+                                    patterns.into_iter().filter(|p| subscribed_patterns.remove(p)).collect()
+                                };
+                                for pat in &targets {
+                                    pubsub.lock().unwrap().punsubscribe(conn_id, pat);
+                                    let count = subscribed_channels.len() + subscribed_patterns.len();
+                                    ws_send!(&resp_subscribe_ack("punsubscribe", pat, count));
+                                }
+                                if targets.is_empty() {
+                                    ws_send!(&resp_subscribe_ack("punsubscribe", "", 0));
+                                }
+                            }
+                            Command::Publish(channel, message) => {
+                                let count = pubsub.lock().unwrap().publish(&channel, &message);
+                                ws_send!(&Value::Integer(count).serialize());
                             }
 
-                        if let Err(e) = ws_sender.send(Message::Text(
-                            String::from_utf8_lossy(&response.serialize()).into_owned().into(),
-                        )).await {
-                            warn!("WS send error on conn {}: {}", conn_id, e);
-                            break;
+                            cmd => {
+                                if is_subscribed && !matches!(cmd, Command::Ping(_)) {
+                                    ws_send!(b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in subscribe mode\r\n");
+                                    continue 'outer;
+                                }
+                                let response = store.execute(cmd.clone());
+                                if let Some(b_msg) = broadcast_for(&cmd, &response)
+                                    && let Err(e) = tx.send((conn_id, b_msg))
+                                {
+                                    debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
+                                }
+                                ws_send!(&response.serialize());
+                            }
                         }
                     }
                     Some(Ok(_)) => {}
@@ -765,11 +1169,11 @@ async fn handle_ws(
                     None => break,
                 }
             }
+
             result = rx.recv() => {
                 match result {
                     Ok((sender_id, msg)) if sender_id != conn_id => {
-                        if let Err(e) = ws_sender.send(Message::Text(msg.into())).await {
-                            warn!("WS broadcast send error on conn {}: {}", conn_id, e);
+                        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
                             break;
                         }
                     }
@@ -781,6 +1185,23 @@ async fn handle_ws(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+
+            msg = ps_rx.recv(), if is_subscribed => {
+                match msg {
+                    Some(m) => {
+                        let bytes = encode_pubsub_msg(m);
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
         }
+    }
+
+    if !subscribed_channels.is_empty() || !subscribed_patterns.is_empty() {
+        pubsub.lock().unwrap().unsubscribe_all(conn_id);
     }
 }

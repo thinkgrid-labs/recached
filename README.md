@@ -15,9 +15,9 @@
 
 On the backend it speaks RESP, so any Redis client works against it today. In the browser, you import it as a `.wasm` module and get zero-latency local reads with automatic background sync to the server — no extra round-trips, no polling, no external state management library.
 
-> [!WARNING]
+> [!NOTE]
 > **Status: Active Development**
-> The core protocol, TTL engine, and sync architecture are solid. Recached covers the most common Redis use cases — strings, expiry, counters, batch ops, key scans. It is not yet a full Redis replacement (no collections, no pub/sub, no persistence). Best for local-first web apps, session caches, rate limiters, and edge caching experiments.
+> Recached covers the most common Redis use cases — strings, expiry, counters, batch ops, all collection types (Hash/List/Set/Sorted Set), transactions, and pub/sub. It is not yet a full Redis replacement (no persistence, no replication, no Lua scripting). Best for local-first web apps, session caches, rate limiters, and edge caching experiments.
 
 ---
 
@@ -66,6 +66,18 @@ import Redis from 'ioredis';
 const cache = new Redis('redis://127.0.0.1:6379');
 await cache.set('user:1', 'Alice');
 console.log(await cache.get('user:1')); // "Alice"
+
+// Collections work too
+await cache.hset('session:42', 'user', 'Alice', 'role', 'admin');
+await cache.lpush('queue:jobs', 'task-1', 'task-2');
+await cache.sadd('tags:post:1', 'rust', 'wasm', 'cache');
+await cache.zadd('leaderboard', 100, 'alice', 200, 'bob');
+
+// Pub/Sub
+const sub = new Redis('redis://127.0.0.1:6379');
+sub.subscribe('events');
+sub.on('message', (channel, message) => console.log(channel, message));
+await cache.publish('events', 'hello');
 ```
 
 ### Use from the browser (WebAssembly, port 6380)
@@ -81,9 +93,14 @@ cache.connect('ws://127.0.0.1:6380');
 
 cache.set('theme', 'dark');        // writes locally + pushes to server
 console.log(cache.get('theme'));   // reads from local WASM memory — 0ms
+
+// Subscribe to server-side pub/sub channels
+cache.subscribe('notifications');
+// Publish from the browser to all subscribers
+cache.publish('events', 'user-clicked');
 ```
 
-Any `SET` or `DEL` on the server side is automatically pushed to all connected browser instances. Any write from the browser is pushed to the server and fanned out to other browser clients.
+Any mutation on the server side (`SET`, `DEL`, `HSET`, `LPUSH`, etc.) is automatically pushed to all connected browser instances. Any write from the browser is pushed to the server and fanned out to other clients.
 
 ---
 
@@ -105,9 +122,9 @@ Three crates with hard dependency boundaries:
 
 | Crate | Role |
 |---|---|
-| `core-engine` | Pure state machine — no networking, no I/O. RESP parser (depth-limited), typed command dispatch, `Arc<RwLock<HashMap>>` store with optional key cap. Compiles to both native and `wasm32`. |
-| `server-native` | Tokio TCP server (port 6379) + WebSocket server (port 6380). Persistent read buffers handle fragmented RESP. Connection semaphore, auth rate-limiting, sender-ID broadcast filter, structured `tracing` logging throughout. |
-| `wasm-edge` | `wasm-bindgen` JS bindings. Local zero-latency reads, RESP-over-WebSocket sync with the server. Closure lifecycle is managed correctly — reconnecting doesn't leak memory. |
+| `core-engine` | Pure state machine — no networking, no I/O. RESP parser (depth-limited), typed command dispatch, `Arc<RwLock<HashMap>>` store with `EntryValue` enum (Str/Hash/List/Set/ZSet), TTL engine, optional key cap. Compiles to both native and `wasm32`. |
+| `server-native` | Tokio TCP server (port 6379) + WebSocket server (port 6380). Persistent read buffers handle fragmented RESP. Per-connection pub/sub delivery via `mpsc` channels. Connection semaphore, auth rate-limiting, sender-ID broadcast filter, structured `tracing` logging. |
+| `wasm-edge` | `wasm-bindgen` JS bindings. Local zero-latency reads, RESP-over-WebSocket sync with the server. Closure lifecycle managed correctly — reconnecting doesn't leak memory. |
 
 ---
 
@@ -126,11 +143,51 @@ Three crates with hard dependency boundaries:
 - Structured `tracing` logs
 
 **Commands**
-- Core: `PING`, `AUTH`
-- Strings: `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `GET`, `GETSET`, `MGET`, `MSET`, `SETNX`, `SETEX`, `PSETEX`, `APPEND`, `STRLEN`
-- Counters: `INCR`, `DECR`, `INCRBY`, `DECRBY`
-- Expiry: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
-- Keys: `DEL`, `UNLINK`, `EXISTS`, `TYPE`, `RENAME`, `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`
+
+*Core*
+- `PING`, `AUTH`
+
+*Strings*
+- `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `GET`, `GETSET`
+- `MGET`, `MSET`, `SETNX`, `SETEX`, `PSETEX`
+- `APPEND`, `STRLEN`
+- `INCR`, `DECR`, `INCRBY`, `DECRBY`
+
+*Expiry*
+- `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`
+- `TTL`, `PTTL`, `PERSIST`
+
+*Keys*
+- `DEL`, `UNLINK`, `EXISTS`, `TYPE`, `RENAME`
+- `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`
+
+*Hash*
+- `HSET`, `HGET`, `HGETALL`, `HDEL`, `HMGET`
+- `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`, `HSETNX`
+- `HINCRBY`, `HINCRBYFLOAT`
+
+*List*
+- `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`
+- `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`
+- `LSET`, `LREM`, `LTRIM`
+
+*Set*
+- `SADD`, `SMEMBERS`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`
+- `SINTER`, `SINTERSTORE`, `SUNION`, `SUNIONSTORE`, `SDIFF`, `SDIFFSTORE`
+- `SPOP`, `SRANDMEMBER`, `SMOVE`
+
+*Sorted Set*
+- `ZADD` (with `NX`/`XX`/`CH`/`INCR`), `ZREM`, `ZINCRBY`
+- `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`
+- `ZSCORE`, `ZMSCORE`, `ZRANK`, `ZREVRANK`, `ZCARD`, `ZCOUNT`
+
+*Transactions*
+- `MULTI`, `EXEC`, `DISCARD` — queued execution, broadcast on commit
+
+*Pub/Sub*
+- `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`
+- Pattern matching with glob syntax (`*`, `?`, `[...]`)
+- Works over both TCP (port 6379) and WebSocket (port 6380)
 
 ---
 
@@ -140,34 +197,14 @@ Three crates with hard dependency boundaries:
 
 The goal is enough behavioral compatibility to cover the top real-world use cases, not a full Redis clone. Full parity (250+ commands, Lua scripting, RDB/AOF, replication) doesn't fit the browser-sync model and won't be pursued.
 
-**Phase 3 — Collections** ← next
-- Hash (`HSET`, `HGET`, `HGETALL`, `HDEL`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`) — best ROI; structured objects, session blobs
-- List (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`) — queues, message history
-- Set (`SADD`, `SMEMBERS`, `SREM`, `SCARD`, `SISMEMBER`, `SINTER`, `SUNION`, `SDIFF`) — dedup, tagging
-- Sorted Set (`ZADD`, `ZRANGE`, `ZSCORE`, `ZRANK`, `ZREM`, `ZCARD`) — deferred; high complexity, narrow use cases
-
-**Phase 4 — Selected advanced commands**
-- Transactions: `MULTI`, `EXEC`, `DISCARD` — prevent counter races, atomic batch writes
-- Pub/Sub: `SUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE` — natural fit for the WebSocket broadcast layer
-
-Intentionally out of scope: RDB/AOF persistence (a browser-synced in-memory cache doesn't need disk durability), `REPLICAOF` (the native→browser WebSocket is already the sync story), Lua scripting (`EVAL` doesn't run in WASM), server introspection (`INFO`, `SLOWLOG`, `COMMAND`).
-
----
-
-### Beyond Redis
-
-These are things Redis either can't do or requires paid modules/plugins for.
-
-**Performance**
+**Phase 5 — Performance & Ops** ← next
 - [ ] **Sharded `DashMap` core** — swap `RwLock<HashMap>` for a lock-striped concurrent map; removes write bottleneck on high-core-count machines
 - [ ] **RESP3 support** — richer native types (maps, doubles, blob errors) without client workarounds
-
-**Ops**
 - [ ] **Native TLS** — encrypt TCP and WebSocket connections without a sidecar
 - [ ] **Built-in Prometheus metrics** — hit rate, latency percentiles, memory, connection counts at `/metrics`; no module needed
 - [ ] **Pluggable eviction** — LRU, LFU, TTL-priority, ARC via `RECACHED_EVICTION=lfu`
 
-**New primitives**
+**Beyond Redis — new primitives**
 - [ ] **Native JSON type** — `JSET`, `JGET`, `JMERGE` with JSONPath; no RedisJSON module
 - [ ] **Rate-limiting commands** — `RLSET key limit window` / `RLCHECK key`; replaces hand-rolled Lua scripts
 - [ ] **Observable keys** — `WATCH key` over WebSocket delivers a push on every mutation; reactive bindings without polling
@@ -178,15 +215,17 @@ These are things Redis either can't do or requires paid modules/plugins for.
 - [ ] **Offline-first WASM** — IndexedDB persistence layer; cache survives refresh and syncs delta on reconnect
 - [ ] **Typed TypeScript SDK** — generated from the command schema, zero-overhead WASM bindings
 
+Intentionally out of scope: RDB/AOF persistence (a browser-synced in-memory cache doesn't need disk durability), `REPLICAOF` (the native→browser WebSocket is already the sync story), Lua scripting (`EVAL` doesn't run in WASM), server introspection (`INFO`, `SLOWLOG`, `COMMAND`).
+
 ---
 
 ## Contributing
 
 The most useful contributions right now:
 
-1. **Phase 3 collections** — Hash commands (`HSET`/`HGET`/`HGETALL`) are the highest-impact next piece
-2. **Benchmarks** — `redis-benchmark` against Redis 7 on multi-core hardware (results welcome either way)
-3. **Client examples** — React, Vue, or SvelteKit demos using `recached-edge`
-4. **Bug reports** — edge cases in the RESP parser, TTL eviction, or WebSocket sync
+1. **Benchmarks** — `redis-benchmark` against Redis 7 on multi-core hardware (results welcome either way)
+2. **Client examples** — React, Vue, or SvelteKit demos using `recached-edge`
+3. **Phase 5 performance** — `DashMap` swap or Prometheus metrics endpoint
+4. **Bug reports** — edge cases in the RESP parser, TTL eviction, pub/sub delivery, or WebSocket sync
 
 Open a PR or file an issue.
