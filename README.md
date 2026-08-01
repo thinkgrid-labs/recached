@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="recached.jpg" alt="Recached" width="800" />
+  <img src="https://recached.dev/recached.jpg" alt="Recached" width="800" />
   <h1>Recached has moved</h1>
   <p><b>This repository is no longer maintained here.</b></p>
 
